@@ -30,6 +30,7 @@
   "./clients/installer/index.js",
   "./clients/instance-reaper.js",
   "./clients/instance-registry.js",
+  "./clients/language-profile.js",
   "./clients/latency-logger.js",
   "./clients/lens-config.js",
   "./clients/lens-events.js",
@@ -42,6 +43,13 @@
   "./clients/lsp/index.js",
   "./clients/memory-sampler.js",
   "./clients/message-end-attribution.js",
+  "./clients/mutating-tool.js",
+  "./clients/mutation-bridge.js",
+  // #2430: the agent_settled sweep and its post-drain re-baseline. Eager
+  // because they run inside the settle handler, on the same path as the
+  // deferred drain they bracket.
+  "./clients/observed-mutation-sources.js",
+  "./clients/observed-mutation.js",
   "./clients/package-root.js",
   "./clients/path-attribution-telemetry.js",
   "./clients/path-utils.js",
@@ -49,6 +57,7 @@
   "./clients/project-trust.js",
   "./clients/quiet-window.js",
   "./clients/read-bridge.js",
+  "./clients/read-guard-tool-lines.js",
   // index.ts:56 is type-only, but dependency-cruiser parses it as an edge.
   "./clients/read-guard.js",
   "./clients/recent-touches.js",
@@ -67,6 +76,7 @@
   "./clients/sessionstart-logger.js",
   "./clients/smells-rollup.js",
   "./clients/startup-timing.js",
+  "./clients/test-runner-delivery.js",
   "./clients/tool-definition.js",
   "./clients/tool-render.js",
   "./clients/tool-set-policy.js",

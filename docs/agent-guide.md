@@ -185,8 +185,61 @@ pi-lens writes to files **outside your own tool calls** (`docs/features.md`
 - **`write` then `edit` on the same file, same turn:** the write's autofix
   demotes to deferred too, so the file's mutation history stays coherent. This
   resets at the next turn.
+- **Any other tool that edits a file:** pi-lens recognizes it by the SHAPE of
+  its arguments rather than its name (`clients/mutating-tool.ts`), so a host or
+  extension tool called `replace` or `insert` gets the same chain `edit` gets:
+  a turn-state entry, a change-log receipt attributed to that tool, and a
+  *deferred* auto-fix. Its lines are resolved when the anchor is unambiguous
+  (roughly two-thirds of anchors in practice — `clients/hashline-anchor.ts`);
+  otherwise the mutation is recorded whole-file with lines unknown, and the
+  read-before-edit guard takes its no-line-info arm rather than guessing.
+  Deferred is the default for every edit-shaped tool pi-lens cannot place,
+  because formatting between the steps of a multi-call rewrite fights the tool
+  that is still writing.
+- **A tool whose shape is unrecognized too:** pi-lens watches instead of
+  guessing (`clients/observed-mutation.ts`). A call that names a file gets a
+  bounded pre/post snapshot of THAT PATH — the file itself, or a directory's own
+  entries — and nothing else, so a write landing on a neighbouring file is never
+  attributed to it. Anything that changed is replayed through the same chain,
+  and the tool is then remembered as mutating: for this session on the first
+  sighting, persisted under the project's data directory on the second, so a
+  later session classifies it by name with no snapshot at all. Three quiet
+  observations in a row withdraw a session attribution again, and a withdrawn
+  tool can be learned back from a later real edit. An observation pi-lens could
+  not finish — a directory with more entries than it watches — counts as
+  neither, so a wide codemod is never written off on a look it never took. A
+  call that names
+  no file is caught at `agent_settled` by an incremental content check over the
+  files pi-lens has already read, written, diagnosed or opened on a language
+  server — a rotating window per turn, reading only what actually moved; a file
+  it has never seen has no baseline, so that last-resort net does not cover it,
+  and a file it cannot verify is reported as such rather than reformatted on a
+  timestamp alone.
 - The conservative actionable-warnings autofix (LSP quickfixes, hard-capped)
   is unchanged: it always runs at `agent_end`.
+
+**Extension authors: record your own writes.** If your extension writes files
+outside pi-lens's tool events — its own registered tool, a spawned rewriter —
+tell pi-lens through the in-process mutation bridge, the write-side sibling of
+the read bridge:
+
+```js
+const bridge = globalThis[Symbol.for("pi-lens:mutation-bridge")];
+if (bridge?.version === 1) {
+  bridge.recordMutation({
+    filePath,               // absolute path
+    kind: "edit",           // "write" replaces the whole file; "edit" is partial
+    editRanges: [[12, 18]], // optional, 1-based inclusive
+    consumer: "my-extension",
+  });
+}
+```
+
+Check `version` before calling; a version you do not recognize is unsupported.
+Calling when pi-lens is absent or the guard is disabled is safe — the bridge is
+missing or drops the call. `recordMutation` returns `true` when pi-lens took the
+record and `false` when it dropped it, so you can count your own drops. pi-lens's
+own `ast_grep_replace apply:true` records through this same bridge.
 
 Consequences for you:
 

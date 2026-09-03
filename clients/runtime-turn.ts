@@ -119,6 +119,7 @@ import {
 // (widget-state.ts) can use the marker without importing this orchestrator —
 // see clients/stale-marker.ts's doc comment.
 import { incrementDegradationCount } from "./degradation-ledger.js";
+import { emitBounded } from "./bounded-telemetry.js";
 import {
 	degradeDemotedFindingBody,
 	formatDeliveryCapNote,
@@ -126,12 +127,19 @@ import {
 } from "./demoted-finding-render.js";
 import { STALE_LINE_MARKER } from "./stale-marker.js";
 import { getActiveSessionId } from "./session-lifecycle.js";
+
 import {
+	drainRenderedDependencyDriftFilePaths,
 	getWidgetBlockingFilesForSweep,
+	incrementWidgetDependencyDriftDelivery,
 	markWidgetFileBlockersStale,
 	recordRunner,
+	retireWidgetDependencyDriftBlockers,
 } from "./widget-state.js";
 import type { TestRunnerFindingsCache } from "./project-diagnostics/runner-adapters/runner-findings.js";
+
+/** Maximum detailed notify-stall coverage-gap rows emitted in one turn. */
+const LATE_AUX_COVERAGE_GAP_DETAIL_CAP_PER_TURN = 20;
 
 interface TurnEndDeps {
 	ctxCwd?: string;
@@ -147,6 +155,16 @@ interface TurnEndDeps {
 	owner?: TurnStateOwner;
 	resetLSPService: () => void;
 	resetFormatService: () => void;
+	/** Stage completed test results for the post-agent non-context surface. */
+	onTestRunnerComplete?: (args: {
+		cwd: string;
+		sessionId: string;
+		generation: number;
+		targetCount: number;
+		hasFindings: boolean;
+	}) => void;
+	/** Stable session identity from the event ctx that fired this turn_end. */
+	sessionId?: string;
 }
 
 /**
@@ -402,6 +420,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		deadCodeClients,
 		depChecker,
 		testRunnerClient,
+		sessionId,
 		owner,
 		resetLSPService,
 		resetFormatService,
@@ -459,6 +478,50 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	}
 
 	const files = Object.keys(turnState.files);
+
+	/**
+	 * #2275: widget-footer sibling of #1950's inline-blocker cap, for the
+	 * widget store's OWN dependency-drift demotion
+	 * (`markWidgetFileBlockersStale`, driven by the freshness sweep further
+	 * down this function) — a completely separate store from
+	 * `RuntimeCoordinator`'s inline-blocker map, so it needed its own
+	 * delivery count (`WidgetDiagnostic.staleDeliveryCount`) rather than
+	 * inheriting one.
+	 *
+	 * Review F1: the population is what the footer RENDERED since the last
+	 * turn end, drained here — not every file that merely holds a demoted
+	 * row. The footer draws one record per pass (`withBlocking[0]`, its top
+	 * five entries) and may not be drawn at all, so a per-turn walk of the
+	 * whole store charged deliveries the agent never received and retired a
+	 * delivery early. This is the widget-surface analogue of the inline
+	 * loop's own `pendingDependencyDriftDeliveries` deferral below: both
+	 * commit a delivery only once the surface has actually served it. Every
+	 * `deliveryCount` reported to the ledger is therefore a count of RENDERS.
+	 *
+	 * Fix-round 3 (#2275 review F1): this drain/charge MUST run before the
+	 * `files.length === 0` early return below — a read-only turn (no
+	 * modified files) still repaints the footer and can draw a demoted row,
+	 * so a cap that only charged deliveries below the early return silently
+	 * starved on quiet turns: the footer re-rendered the same demoted row
+	 * every turn while the delivery count never advanced. The drain is a
+	 * Set.take() plus one map lookup per drained file — cheap enough to run
+	 * unconditionally on every turn end.
+	 */
+	let widgetDemotedFindingsRetired = 0;
+	for (const wPath of drainRenderedDependencyDriftFilePaths()) {
+		const deliveryCount = incrementWidgetDependencyDriftDelivery(wPath);
+		if (deliveryCount >= DEPENDENCY_DRIFT_MAX_DELIVERIES) {
+			const capRetired = retireWidgetDependencyDriftBlockers(wPath);
+			if (capRetired) {
+				widgetDemotedFindingsRetired += 1;
+				incrementDegradationCount({
+					kind: "demoted-finding-retired",
+					subject: `widget-blocker:${toRunnerDisplayPath(cwd, wPath)}`,
+					reason: `capped after ${deliveryCount} deliveries with no re-run; hidden from the pi-lens footer, still listed by lens_diagnostics mode=all — re-run can still confirm`,
+				});
+			}
+		}
+	}
 
 	// R1 (#1443 follow-up): a read-only turn (no files touched) must not take
 	// the fast idle-reset path while a carried cascade run — or one still
@@ -1811,8 +1874,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	});
 
 	// --- Test runner: fire once per turn after all edits are done ---
-	// Runs for each unique test target across modified files; results appear
-	// in the next turn's context injection alongside jscpd/madge findings.
+	// Runs for each unique test target across modified files; results remain in
+	// the pull-diagnostics cache and are delivered after the agent settles.
 	if (!getFlag("no-tests") && files.length > 0) {
 		const seen = new Set<string>();
 		const targets: NonNullable<
@@ -1874,7 +1937,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				`turn_end: firing ${targets.length} test target(s) async (non-blocking)`,
 			);
 			const firedAtTurn = runtime.turnIndex;
-			const firedSessionId = runtime.telemetrySessionId;
+			const firedSessionId = sessionId ?? runtime.telemetrySessionId;
 			const priorTestCache = cacheManager.readCache<TestRunnerFindingsCache>(
 				"test-runner-findings",
 				cwd,
@@ -1937,8 +2000,31 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					const stale = runtime.turnIndex !== firedAtTurn;
 					const failures: string[] = [];
 					const resultValues: TestResult[] = [];
+					let rejectedCount = 0;
 					for (const r of results) {
 						if (r.status === "rejected") {
+							rejectedCount++;
+							emitBounded(
+								"test_runner_delivery",
+								`${cwd}:generation:${testRunGeneration}:rejected`,
+								{
+									filePath: cwd,
+									durationMs: 0,
+									metadata: {
+										outcome: "runner-promise-rejected",
+										sessionId: firedSessionId,
+										generation: testRunGeneration,
+										targetCount: targets.length,
+										droppedDetailCount: 0,
+										reason: String(r.reason).slice(0, 500),
+									},
+								},
+								{
+									ledgerKind: "test-runner-delivery",
+									reason: "test runner promise rejected",
+									capPerTurn: { limit: 8, turnIndex: firedAtTurn },
+								},
+							);
 							dbg(`turn_end: test run rejected — ${r.reason}`);
 							continue;
 						}
@@ -1995,6 +2081,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 							if (formatted) failures.push(formatted);
 						}
 					}
+					if (rejectedCount > 0) {
+						failures.push(
+							`Test runner rejected ${rejectedCount} promise(s) before producing a structured result.`,
+						);
+					}
 					if (failures.length > 0) {
 						const currentGeneration =
 							cacheManager.readCache<TestRunnerFindingsCache>(
@@ -2027,6 +2118,17 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 							},
 							cwd,
 						);
+						try {
+							deps.onTestRunnerComplete?.({
+								cwd,
+								sessionId: firedSessionId,
+								generation: testRunGeneration,
+								targetCount: targets.length,
+								hasFindings: true,
+							});
+						} catch (deliveryErr) {
+							dbg(`turn_end: test delivery staging failed — ${deliveryErr}`);
+						}
 						if (
 							getFlag("lens-guard") &&
 							firedSessionId === runtime.telemetrySessionId
@@ -2066,9 +2168,49 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 							);
 						}
 						dbg(
-							`turn_end: ${failures.length} test failure(s) cached for next context injection${stale ? " (stale — turn advanced while tests ran)" : ""}`,
+							`turn_end: ${failures.length} test failure(s) cached for pull diagnostics and post-agent delivery${stale ? " (stale — turn advanced while tests ran)" : ""}`,
 						);
 					} else if (results.length > 0) {
+						const currentGeneration =
+							cacheManager.readCache<TestRunnerFindingsCache>(
+								"test-runner-findings",
+								cwd,
+							)?.data?.testRunGeneration;
+						if (
+							currentGeneration !== undefined &&
+							currentGeneration > testRunGeneration
+						) {
+							dbg(
+								`turn_end: clean test generation ${testRunGeneration} superseded by ${currentGeneration}`,
+							);
+							return;
+						}
+						cacheManager.writeCache(
+							"test-runner-findings",
+							{
+								...(priorTestCache ?? { content: "" }),
+								content: "",
+								stale: false,
+								results: resultValues,
+								testRunGeneration,
+								launchedFrom,
+								publishedAgainst,
+								provenance: publishedAgainst,
+								superseded,
+							},
+							cwd,
+						);
+						try {
+							deps.onTestRunnerComplete?.({
+								cwd,
+								sessionId: firedSessionId,
+								generation: testRunGeneration,
+								targetCount: targets.length,
+								hasFindings: false,
+							});
+						} catch (deliveryErr) {
+							dbg(`turn_end: test delivery staging failed — ${deliveryErr}`);
+						}
 						if (
 							getFlag("lens-guard") &&
 							firedSessionId === runtime.telemetrySessionId
@@ -2449,6 +2591,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	let lateAuxExpired = 0;
 	let lateAuxCeilingExhausted = 0;
 	let lateAuxAnswered = 0;
+	let lateAuxNotifyStallDemoted = 0;
+	const lateAuxCoverageGapPairs: Array<{
+		filePath: string;
+		serverId: string;
+	}> = [];
+	let lateAuxCoverageGapDetailCount = 0;
+	let lateAuxCoverageGapDropCount = 0;
 	const lateAuxStuckPairs: Array<{ filePath: string; serverId: string }> = [];
 	if (drainedPairs.length > 0) {
 		const byFile = new Map<string, typeof drainedPairs>();
@@ -2462,7 +2611,12 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			for (const [lateAuxPath, pairs] of byFile) {
 				let cached: Map<
 					string,
-					{ diags: LSPDiagnostic[]; publishedAt?: number }
+					{
+						diags: LSPDiagnostic[];
+						publishedAt?: number;
+						notifyStallDemoted?: boolean;
+						demotedAt?: number;
+					}
 				>;
 				try {
 					cached = await service.readCachedDiagnosticsForServers(
@@ -2501,6 +2655,39 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						// No live client for this server any more — best-effort probe,
 						// drop the pair silently.
 						lateAuxClientGone += 1;
+						continue;
+					}
+					if (cachedEntry.notifyStallDemoted) {
+						if (
+							cachedEntry.demotedAt === undefined ||
+							pair.markedAtMs > cachedEntry.demotedAt
+						) {
+							// A pair marked after teardown belongs to the missing
+							// generation, so it follows ordinary clientGone handling.
+							lateAuxClientGone += 1;
+							continue;
+						}
+						// #2356: notify-stall teardown is a transient absence while the
+						// breaker cools down, but only for a pair marked before teardown.
+						lateAuxNotifyStallDemoted += 1;
+						const pastTtl = isPendingAuxiliaryPastRearmTtl(pair);
+						const atCeiling = (pair.rearmCount ?? 0) >= MAX_LATE_AUX_REARMS;
+						if (!pastTtl && !atCeiling) {
+							rearmPendingAuxiliaryCoverage(pair);
+							lateAuxRearmed += 1;
+							if (lateAuxStuckPairs.length < 20)
+								lateAuxStuckPairs.push({
+									filePath: pair.filePath,
+									serverId: pair.serverId,
+								});
+						} else {
+							if (pastTtl) lateAuxExpired += 1;
+							else lateAuxCeilingExhausted += 1;
+							lateAuxCoverageGapPairs.push({
+								filePath: pair.filePath,
+								serverId: pair.serverId,
+							});
+						}
 						continue;
 					}
 					const rawDiags = cachedEntry.diags;
@@ -2598,6 +2785,37 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		} catch (err) {
 			dbg(`turn_end: late-auxiliary probe failed: ${err}`);
 		}
+		// #2356: a demoted scanner that never gets replaced remains a coverage
+		// gap. Re-raise it once when the existing bounded late-pair window closes,
+		// preserving the server/file identity in both the ledger and latency row.
+		for (const pair of lateAuxCoverageGapPairs) {
+			const normalizedPairPath = normalizeMapKey(pair.filePath);
+			const emitted = emitBounded(
+				"lsp_scanner_coverage_gap",
+				`${pair.serverId}:${normalizedPairPath}`,
+				{
+					filePath: normalizedPairPath,
+					durationMs: 0,
+					metadata: {
+						source: "late-auxiliary",
+						serverIds: [pair.serverId],
+						reason: "notify-stall-replacement-unavailable",
+						reRaised: true,
+					},
+				},
+				{
+					ledgerKind: "lsp-scanner-coverage-gap",
+					reason:
+						"notify-stall replacement was not available before late-coverage ceiling",
+					capPerTurn: {
+						limit: LATE_AUX_COVERAGE_GAP_DETAIL_CAP_PER_TURN,
+						turnIndex: runtime.turnIndex,
+					},
+				},
+			);
+			if (emitted) lateAuxCoverageGapDetailCount += 1;
+			else lateAuxCoverageGapDropCount += 1;
+		}
 		logLatency({
 			type: "phase",
 			toolName: "turn_end",
@@ -2618,6 +2836,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				expired: lateAuxExpired,
 				ceilingExhausted: lateAuxCeilingExhausted,
 				answered: lateAuxAnswered,
+				notifyStallDemoted: lateAuxNotifyStallDemoted,
+				coverageGapReRaised: lateAuxCoverageGapPairs.length,
+				coverageGapReRaisedDetailed: lateAuxCoverageGapDetailCount,
+				coverageGapReRaisedDropped: lateAuxCoverageGapDropCount,
 				capEvicted: lateAuxCapEvicted,
 				stuckPairs: lateAuxStuckPairs,
 			},
@@ -2851,6 +3073,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			// answers that from latency.log even when the payload is empty, and
 			// the payload itself carries the retirement note when it is not.
 			demotedFindingsRetired,
+			// #2275: the widget-footer store's own dependency-drift retirements —
+			// a separate surface/counter from `demotedFindingsRetired` above,
+			// since a widget retirement never touches `advisoryParts` or the
+			// `turn-end-findings-last` suppression cache the block below clears.
+			widgetDemotedFindingsRetired,
 		},
 	});
 	resetFormatService();

@@ -264,8 +264,35 @@ const timingSensitiveInclude = [
 // file itself, which corrects the timeout values to match ast-grep's own
 // declared budget instead of a shorter invented constant — belt-and-braces,
 // not a substitute for phasing).
+// Membership is enforced, not conventional (#2344): tests/config/
+// lsp-spawn-heavy-coverage.test.ts derives candidates from the real spawn
+// seams (a bare `launchLSP(` call, a `getServerById(` registry spawn, or an
+// import of the fake-LSP fixture) and fails when a spawning test lands
+// outside this list without a documented exemption — or a member here
+// silently goes stale.
 const lspSpawnHeavyInclude = [
 	"tests/clients/ast-grep-rule-precedence-followups.test.ts",
+	// #2344: npm test leaves this real-child integration suite in the default
+	// project unless it is explicitly phased here. `test:integration` still
+	// selects the same file positionally, while `test:unit` excludes it below.
+	"tests/clients/lsp/integration.test.ts",
+	"tests/clients/lsp/workspace-diagnostics-sweep-attribution.integration.test.ts",
+	// #873/#448: the dispatch LSP runner against a real stdio JSON-RPC server
+	// — a real child spawn through the production LSPService plus a
+	// `.pi-lens/lsp.json` custom server, waiting on real first-document
+	// diagnostics. Same #1022/#2332 contention class as its lane siblings.
+	"tests/clients/dispatch/runners/lsp-real-runner.test.ts",
+	// #2436: spawns a real fake-lsp-server.mjs child (through a parent shim
+	// process) and asserts it self-terminates within a 2s ceiling after the
+	// shim is SIGKILLed — a process-death-timing budget across two nested
+	// spawns, same #1022/#2332 contention class as its lane siblings.
+	"tests/clients/lsp/fake-lsp-server-parent-watchdog.test.ts",
+	// #2436 review round 2: pins spawnFakeLspServer's onTestFinished backstop
+	// by spawning a real fixture child via the shared helper and asserting,
+	// in a later test, that it died within a 2s ceiling with no explicit
+	// kill — same process-death-timing budget and contention class as the
+	// watchdog test above.
+	"tests/support/fake-lsp-server.test.ts",
 ];
 
 // #1920: files that assert REAL wall-clock elapsed-time budgets (Date.now()
@@ -286,6 +313,10 @@ const wallClockBudgetInclude = [
 	"tests/clients/cascade-turn-merge.test.ts",
 	"tests/clients/read-expansion-enrichment.test.ts",
 	"tests/clients/pipeline-lsp-sync.test.ts",
+	// #2358: the flat-server discriminator asserts the real outstanding wedge
+	// window. Keep child-process CPU sampling and this wall-clock lower bound in
+	// the fully serialized, dead-last phase.
+	"tests/clients/lsp/service-notify-cpu-liveness.test.ts",
 ];
 
 export default defineConfig({
@@ -391,15 +422,14 @@ export default defineConfig({
 				test: {
 					name: "lsp-spawn-heavy",
 					include: lspSpawnHeavyInclude,
-					exclude: sharedExclude,
+					exclude: [...sharedExclude, ...unitOnlyExclude],
 					globalSetup: sharedGlobalSetup,
 					setupFiles: sharedSetupFiles,
 					execArgv: sharedExecArgv,
-					// Full serialization, not just a cap: this is a single file, so
-					// there are no siblings to share the phase with anyway — the
-					// point is to guarantee zero overlap with the "default" project's
-					// fork storm (the actual contention source, see #1022 above), not
-					// to bound intra-project concurrency.
+					// Full serialization, not just a cap: four files, but the point
+					// is to guarantee zero overlap with the "default" project's
+					// fork storm (the actual contention source, see #1022/#2332
+					// above), not to bound intra-project concurrency.
 					maxWorkers: 1,
 					// Last phase: by the time this runs, "default", "grammar-heavy",
 					// and "timing-sensitive" have all fully drained, so the real

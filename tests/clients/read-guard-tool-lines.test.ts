@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,7 +9,17 @@ import {
 	stripOldTextTrailingWhitespace,
 	tryCorrectIndentationMismatch,
 } from "../../clients/read-guard-tool-lines.js";
+import {
+	applyPartiallyApplicableEdits,
+	PartialApplyRecordStore,
+	type PartiallyApplicableEdit,
+} from "../../clients/partial-edit-apply.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
+import { ReadGuard } from "../../clients/read-guard.js";
+import {
+	hashlineFixture,
+	hashlineStoreCarried,
+} from "../support/hashline-anchor-vectors.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 vi.mock("../../clients/read-guard-logger.js", async (importOriginal) => ({
@@ -580,19 +591,30 @@ describe("read-guard tool line helpers", () => {
 			expect(result.preflightError).toMatch(/RETRYABLE/);
 			expect(result.preflightError).toMatch(/edits\[1\]/);
 			expect(result.preflightError).toMatch(/was not found/);
-			expect(result.partiallyApplicable).toEqual([
-				{
-					oldText: "function bar() {\n  return 2;\n}",
-					newText: "ok",
-					originalIndex: 0,
-				},
-			]);
+			expect(result.partiallyApplicable).toHaveLength(1);
+			expect(result.partiallyApplicable?.[0]).toMatchObject({
+				oldText: "function bar() {\n  return 2;\n}",
+				appliedSpanText: "function bar() {\n  return 2;\n}",
+				newText: "ok",
+				originalIndex: 0,
+			});
+			// #1053: the carried span and snapshot identity point at the exact
+			// preflight-approved region.
+			const lf = fs.readFileSync(filePath, "utf-8").replace(/\r\n/g, "\n");
+			const start = lf.indexOf("function bar() {\n  return 2;\n}");
+			expect(result.partiallyApplicable?.[0]).toMatchObject({
+				spanStart: start,
+				spanEnd: start + "function bar() {\n  return 2;\n}".length,
+			});
+			expect(result.partiallyApplicable?.[0].snapshot.hash).toMatch(
+				/^[0-9a-f]{64}$/,
+			);
 		} finally {
 			env.cleanup();
 		}
 	});
 
-	it("does not mark normalized-only matches as partially applicable", () => {
+	it("carries a normalized-only match as its raw span during partial apply", () => {
 		const env = setupTestEnvironment("read-guard-lines-partial-not-exact-");
 		try {
 			const filePath = path.join(env.tmpDir, "file.ts");
@@ -616,11 +638,55 @@ describe("read-guard tool line helpers", () => {
 			);
 
 			expect(result.preflightError).toMatch(/RETRYABLE/);
-			expect(result.partiallyApplicable).toBeUndefined();
+			expect(result.partiallyApplicable).toHaveLength(1);
+			expect(result.partiallyApplicable?.[0].appliedSpanText).toBe(
+				"const a = 1;   \nconst b = 2;",
+			);
 		} finally {
 			env.cleanup();
 		}
 	});
+
+	it.each([
+		["lone-CR line endings", "const a = 1;\rconst b = 2;\r", "const b = 2;"],
+		[
+			"Unicode dash matching",
+			"const a = x–y;\nconst b = 2;\n",
+			"const a = x-y;",
+		],
+		[
+			"Unicode quote matching",
+			"const a = ‘value’;\nconst b = 2;\n",
+			"const a = 'value';",
+		],
+	])(
+		"carries %s as a raw span beside a missing edit",
+		(_label, raw, oldText) => {
+			const env = setupTestEnvironment("read-guard-lines-normalized-partial-");
+			try {
+				const filePath = path.join(env.tmpDir, "file.ts");
+				fs.writeFileSync(filePath, raw);
+				const result = getTouchedLinesForGuard(
+					{
+						toolName: "edit",
+						input: {
+							path: filePath,
+							edits: [
+								{ oldText, newText: "replacement" },
+								{ oldText: "const missing = true;", newText: "noop" },
+							],
+						},
+					},
+					filePath,
+				);
+				expect(result.preflightError).toMatch(/RETRYABLE/);
+				expect(result.partiallyApplicable).toHaveLength(1);
+				expect(result.partiallyApplicable?.[0].oldText).toBe(oldText);
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
 
 	it("blocks mixed range + oldText edits when an oldText target is unresolved", () => {
 		const env = setupTestEnvironment("read-guard-lines-mixed-");
@@ -1488,5 +1554,758 @@ describe("getTouchedLinesForGuard — confusable Unicode hyphen normalization (#
 		);
 		expect(result.preflightError).toMatch(/RETRYABLE|RE-READ REQUIRED/);
 		expect(result.touchedLines).toBeUndefined();
+	});
+});
+
+// ── #1053/#2402: preflight carries spans + snapshot identity; exact retries ──
+describe("getTouchedLinesForGuard — preflight spans and exact-retry recognition (#2402)", () => {
+	it("carries spans resolved in the snapshot's LF view on a CRLF file", () => {
+		const env = setupTestEnvironment("rg-spans-crlf-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			const raw = "const a = 1;\r\nconst b = 2;\r\n";
+			fs.writeFileSync(filePath, raw);
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{ oldText: "const b = 2;", newText: "const b = 20;" },
+							{ oldText: "missing line", newText: "noop" },
+						],
+					},
+				},
+				filePath,
+			);
+
+			const edit = result.partiallyApplicable?.[0];
+			expect(edit).toBeDefined();
+			// The span offsets are LF-view offsets (CRLF never inflates them).
+			const lf = raw.replace(/\r\n/g, "\n");
+			expect(edit!.spanStart).toBe(lf.indexOf("const b = 2;"));
+			expect(edit!.spanEnd).toBe(edit!.spanStart + "const b = 2;".length);
+			expect(edit!.appliedSpanText).toBe("const b = 2;");
+			expect(edit!.snapshot.hash).toMatch(/^[0-9a-f]{64}$/);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("marks an exact retry of an applied pair as already-applied, not a miss", () => {
+		const env = setupTestEnvironment("rg-exact-retry-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const a = 1;\nconst b = 20;\n");
+			const records = new PartialApplyRecordStore();
+			records.record(filePath, "const b = 2;", "const b = 20;");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{ oldText: "const b = 2;", newText: "const b = 20;" },
+							{ oldText: "function gone() {}", newText: "noop" },
+						],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			expect(result.alreadyAppliedEdits).toEqual([0]);
+			expect(result.partiallyApplicable).toBeUndefined();
+			expect(result.preflightError).toMatch(/edits\[1\]/);
+			expect(result.preflightError).toContain("already applied");
+			// edit[0] is never counted as a failure.
+			expect(result.preflightError).not.toMatch(/edits\[0\]\.oldText/);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("keeps an oldText-in-newText retry out of partiallyApplicable", () => {
+		const env = setupTestEnvironment("rg-contained-retry-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(
+				filePath,
+				"import { A } from 'm';\nimport { B } from 'm';\n",
+			);
+			const records = new PartialApplyRecordStore();
+			records.record(
+				filePath,
+				"import { A } from 'm';",
+				"import { A } from 'm';\nimport { B } from 'm';",
+			);
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{
+								oldText: "import { A } from 'm';",
+								newText: "import { A } from 'm';\nimport { B } from 'm';",
+							},
+							{ oldText: "function gone() {}", newText: "noop" },
+						],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			// The applied record resolves the retry BEFORE the oldText matches
+			// again inside its own newText — re-applying would duplicate it.
+			expect(result.alreadyAppliedEdits).toEqual([0]);
+			expect(result.partiallyApplicable).toBeUndefined();
+			expect(result.preflightError).toContain("already applied");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("answers a fully already-applied batch with the ✅ verdict", () => {
+		const env = setupTestEnvironment("rg-pure-retry-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const a = 1;\nconst b = 20;\n");
+			const records = new PartialApplyRecordStore();
+			records.record(filePath, "const b = 2;", "const b = 20;");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [{ oldText: "const b = 2;", newText: "const b = 20;" }],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			expect(result.preflightError?.startsWith("✅ ALREADY APPLIED")).toBe(
+				true,
+			);
+			expect(result.preflightError).toContain("edits[0]");
+			expect(result.alreadyAppliedEdits).toEqual([0]);
+			expect(result.partiallyApplicable).toBeUndefined();
+			expect(result.editBatchSummary).toMatchObject({
+				terminalStatus: "skipped",
+				alreadyAppliedTotal: 1,
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("falls back to normal resolution when the applied state no longer holds", () => {
+		const env = setupTestEnvironment("rg-reverted-retry-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			// The pair was recorded applied, but the file was reverted: oldText is
+			// back and newText is gone. The record must NOT claim already-applied.
+			fs.writeFileSync(filePath, "const a = 1;\nconst b = 2;\n");
+			const records = new PartialApplyRecordStore();
+			records.record(filePath, "const b = 2;", "const b = 20;");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [{ oldText: "const b = 2;", newText: "const b = 20;" }],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			expect(result.alreadyAppliedEdits).toBeUndefined();
+			expect(result.touchedLines).toEqual([2, 2]);
+			expect(result.contentMatchValidated).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("rejects overlapping resolved spans with an explicit message", () => {
+		const env = setupTestEnvironment("rg-overlap-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const abcdef = 1;\nconst tail = 1;\n");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{ oldText: "abcdef", newText: "X" },
+							{ oldText: "cdef", newText: "Y" },
+							{ oldText: "const tail = 1;", newText: "const tail = 2;" },
+							{ oldText: "function gone() {}", newText: "noop" },
+						],
+					},
+				},
+				filePath,
+			);
+
+			expect(result.preflightError).toMatch(/overlapping spans/);
+			expect(result.preflightError).toMatch(/edits\[0\] and edits\[1\]/);
+			// An unrelated valid candidate is excluded too: overlap is a batch-level
+			// safety failure, so no subset may commit.
+			expect(result.partiallyApplicable).toBeUndefined();
+			expect(result.editBatchSummary).toMatchObject({
+				terminalStatus: "blocked",
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("recognizes an identical retry after a formatter rewrote the file post-commit", async () => {
+		const env = setupTestEnvironment("rg-formatter-retry-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			const raw = "const a = 1;\nconst b = 2;\n";
+			fs.writeFileSync(filePath, raw);
+			const spanStart = raw.indexOf("const b = 2;");
+			const edit: PartiallyApplicableEdit = {
+				oldText: "const b = 2;",
+				appliedSpanText: "const b = 2;",
+				newText: "const b = 20;",
+				originalIndex: 0,
+				snapshot: {
+					hash: createHash("sha256").update(raw, "utf8").digest("hex"),
+				},
+				spanStart,
+				spanEnd: spanStart + "const b = 2;".length,
+			};
+			const records = new PartialApplyRecordStore();
+
+			await applyPartiallyApplicableEdits({
+				filePath,
+				edits: [edit],
+				recordStore: records,
+				// A formatter rewrites the file after the commit: it appends a
+				// trailing newline, changing the raw bytes (and thus the file hash)
+				// while leaving the applied line intact.
+				afterWrite: async () => {
+					fs.writeFileSync(filePath, `${fs.readFileSync(filePath, "utf-8")}\n`);
+					return undefined;
+				},
+			});
+
+			// The post-afterWrite state was recorded alongside the post-commit one.
+			expect(
+				records.find(filePath, "const b = 2;", "const b = 20;")
+					?.afterWriteContentHash,
+			).toBeDefined();
+
+			// The identical retry, resolved against the formatter-rewritten file, is
+			// recognized as already-applied instead of falling back to oldText
+			// resolution and re-applying (#2402).
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [{ oldText: "const b = 2;", newText: "const b = 20;" }],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			expect(result.alreadyAppliedEdits).toEqual([0]);
+			expect(result.partiallyApplicable).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not recognize a retry when the payload's newText differs", () => {
+		const env = setupTestEnvironment("rg-different-newtext-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const a = 1;\nconst b = 20;\n");
+			const records = new PartialApplyRecordStore();
+			records.record(filePath, "const b = 2;", "const b = 20;");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{ oldText: "const b = 2;", newText: "const b = 300;" },
+							{ oldText: "function gone() {}", newText: "noop" },
+						],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			// A different newText is NOT the applied pair; the retry fails
+			// honestly instead of being absorbed by the record.
+			expect(result.alreadyAppliedEdits).toBeUndefined();
+			expect(result.preflightError).toMatch(/edits\[0\]\.oldText/);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+// ── #2423: shape adapters behind the mutation-classification seam ───────────
+//
+// `getTouchedLinesForGuard` used to answer only for tool names `edit` and
+// `write`; a host or extension edit tool under any other name fell straight to
+// `{ touchedLines: undefined }`, which reads as "no line info" and lets the
+// guard allow a blind edit. The adapters promoted into
+// `clients/mutating-tool.ts` recognize the INPUT SHAPE instead.
+
+// The `pi-hashline-edit-pro` cases below address lines the way the extension
+// actually does: a bare THREE-CHARACTER base62 anchor ("aB3"), never a decimal
+// line number. Every anchor here comes from the upstream-generated vector table
+// (`tests/support/hashline-anchor-vectors.ts`), and the file under test is
+// written to disk with the exact content those anchors were computed from —
+// because resolution is a lookup against the real file, not a parse.
+
+/** Writes a fixture file and hands back its path plus its anchor table. */
+function writeHashlineFixture(
+	tmpDir: string,
+	name: string,
+	fixture: string,
+): {
+	filePath: string;
+	anchorFor: (line: number) => string;
+	lineCount: number;
+} {
+	const { content, anchorFor, lineCount } = hashlineFixture(fixture);
+	const filePath = path.join(tmpDir, name);
+	fs.writeFileSync(filePath, content, "utf8");
+	return { filePath, anchorFor, lineCount };
+}
+
+describe("#2423 hashline-edit-pro adapter", () => {
+	it("resolves remove_from/remove_to anchors to an inclusive line range", () => {
+		const env = setupTestEnvironment("pi-lens-2423-pro-replace-");
+		try {
+			const { filePath, anchorFor } = writeHashlineFixture(
+				env.tmpDir,
+				"target.ts",
+				"manyBlanks",
+			);
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: anchorFor(12),
+						remove_to: anchorFor(14),
+						replacement_lines: ["const x = 1;"],
+					},
+				},
+				filePath,
+			);
+			expect(result.touchedLines).toEqual([12, 14]);
+			expect(result.preflightError).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("autocorrects a reversed anchor pair the way the extension does", () => {
+		// `swapReversedRanges` in the extension's src/hashline/resolve.ts swaps
+		// them with a warning rather than refusing the edit.
+		const env = setupTestEnvironment("pi-lens-2423-pro-reversed-");
+		try {
+			const { filePath, anchorFor } = writeHashlineFixture(
+				env.tmpDir,
+				"target.ts",
+				"manyBlanks",
+			);
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: anchorFor(14),
+						remove_to: anchorFor(12),
+						replacement_lines: [],
+					},
+				},
+				filePath,
+			);
+			expect(result.touchedLines).toEqual([12, 14]);
+			expect(result.preflightError).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("resolves an `insert` call to its anchor line", () => {
+		const env = setupTestEnvironment("pi-lens-2423-pro-insert-");
+		try {
+			const { filePath, anchorFor } = writeHashlineFixture(
+				env.tmpDir,
+				"target.ts",
+				"manyBlanks",
+			);
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "insert",
+					input: {
+						path: filePath,
+						// Line 8 is `line 7`; line 7 is BLANK, and after review
+						// round 3 (F1) a duplicate-content line is deliberately
+						// unanswerable, so it cannot carry this case.
+						anchor: anchorFor(8),
+						direction: "before",
+						lines: ["// note"],
+					},
+				},
+				filePath,
+			);
+			expect(result.touchedLines).toEqual([8, 8]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does NOT read a decimal line number as an anchor", () => {
+		// The contract is a bare 3-char anchor. Reading "12" as line 12 is what
+		// the first cut of this adapter did, and against the real extension it
+		// blocked every call. It must resolve nothing — and block nothing.
+		const env = setupTestEnvironment("pi-lens-2423-pro-decimal-");
+		try {
+			const { filePath } = writeHashlineFixture(
+				env.tmpDir,
+				"target.ts",
+				"manyBlanks",
+			);
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: "12",
+						remove_to: "18",
+						replacement_lines: ["const x = 1;"],
+					},
+				},
+				filePath,
+			);
+			expect(result.touchedLines).toBeUndefined();
+			expect(result.preflightError).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("reports a stale anchor instead of blocking the edit", () => {
+		const env = setupTestEnvironment("pi-lens-2423-pro-stale-");
+		try {
+			const { filePath } = writeHashlineFixture(
+				env.tmpDir,
+				"target.ts",
+				"manyBlanks",
+			);
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						// A well-formed anchor that no line of this file carries.
+						remove_from: "zZ9",
+						remove_to: "zZ8",
+						replacement_lines: ["const x = 1;"],
+					},
+				},
+				filePath,
+				"session-2423",
+				"corr-2423",
+			);
+			expect(result.touchedLines).toBeUndefined();
+			// Never a block: pi-lens recomputes the extension's hashes without its
+			// persisted store, so "I cannot resolve this" is not evidence that the
+			// agent's anchor is wrong.
+			expect(result.preflightError).toBeUndefined();
+			expect(logReadGuardEvent).not.toHaveBeenCalledWith(
+				expect.objectContaining({ event: "edit_preflight_blocked" }),
+			);
+			// It is reported, though — this is the actionable production record.
+			expect(logReadGuardEvent).toHaveBeenCalledWith(
+				expect.objectContaining({
+					event: "touched_lines_missing",
+					metadata: expect.objectContaining({
+						adapterSource: "hashline-edit-pro",
+						unresolvedReason: "remove_from:anchor_not_found",
+					}),
+				}),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	/**
+	 * Review round 3, finding F1, end to end.
+	 *
+	 * The anchors here are not invented: they come from running the extension's
+	 * own `mapStableHashes` over one simulated edit (the `storeCarried` block of
+	 * `tests/fixtures/hashline-edit-pro/anchor-vectors.json`), which is what the
+	 * hash store persists and serves on the next read.
+	 *
+	 * Before the fix, `remove_from` resolved correctly to line 9 and `remove_to`
+	 * — the `}` on line 10 — resolved to the `}` on line 17, so
+	 * `getTouchedLinesForGuard` returned `[9, 17]`: a nine-line range for a
+	 * two-line edit, handed straight to `readGuard.checkEdit`,
+	 * `cacheManager.addModifiedRange` and the `touched_lines_detected` record.
+	 */
+	it("never hands the guard a range built from a drifted store-carried anchor", () => {
+		const env = setupTestEnvironment("pi-lens-2423-pro-carried-");
+		try {
+			const scenario = hashlineStoreCarried("insertedFunctionAtTop");
+			const filePath = path.join(env.tmpDir, "target.ts");
+			fs.writeFileSync(filePath, scenario.after, "utf8");
+			// The two lines the agent means: `\treturn 0;` and the `}` closing it.
+			expect(scenario.afterLines[8]).toBe("\treturn 0;");
+			expect(scenario.afterLines[9]).toBe("}");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: scenario.carriedAnchorFor(9),
+						remove_to: scenario.carriedAnchorFor(10),
+						replacement_lines: ["\treturn 1;", "}"],
+					},
+				},
+				filePath,
+				"session-2423-carried",
+				"corr-2423-carried",
+			);
+
+			// The wrong range specifically, and any range at all.
+			expect(result.touchedLines).not.toEqual([9, 17]);
+			expect(result.touchedLines).toBeUndefined();
+			expect(result.editRanges).toBeUndefined();
+			// Still never a block — an unresolved anchor is a report.
+			expect(result.preflightError).toBeUndefined();
+			expect(logReadGuardEvent).not.toHaveBeenCalledWith(
+				expect.objectContaining({ event: "edit_preflight_blocked" }),
+			);
+			expect(logReadGuardEvent).not.toHaveBeenCalledWith(
+				expect.objectContaining({ event: "touched_lines_detected" }),
+			);
+			expect(logReadGuardEvent).toHaveBeenCalledWith(
+				expect.objectContaining({
+					event: "touched_lines_missing",
+					metadata: expect.objectContaining({
+						adapterSource: "hashline-edit-pro",
+						unresolvedReason: "remove_from:content_not_unique",
+					}),
+				}),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("stamps its own source discriminator into touched_lines_detected", () => {
+		const env = setupTestEnvironment("pi-lens-2423-pro-source-");
+		try {
+			const { filePath, anchorFor } = writeHashlineFixture(
+				env.tmpDir,
+				"target.ts",
+				"manyBlanks",
+			);
+			getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: anchorFor(2),
+						remove_to: anchorFor(5),
+						replacement_lines: [],
+					},
+				},
+				filePath,
+				"session-2423",
+				"corr-2423",
+			);
+			expect(logReadGuardEvent).toHaveBeenCalledWith(
+				expect.objectContaining({
+					event: "touched_lines_detected",
+					metadata: expect.objectContaining({ source: "hashline_pro_replace" }),
+				}),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("leaves a tool that is neither named nor shaped as a mutation unclassified", () => {
+		const result = getTouchedLinesForGuard(
+			{ toolName: "search", input: { path: "/src/file.ts", query: "x" } },
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toBeUndefined();
+	});
+});
+
+// ── #2423 review round 1, finding F2 ────────────────────────────────────────
+//
+// Recognizing a shape and resolving a range are separate questions. The first
+// cut claimed on `operations` / `ops` / `set_line`, and on `anchor` +
+// `direction`, and then BLOCKED when it could not resolve — so a tool that
+// merely happened to carry one of those fields was denied by pi-lens.
+
+describe("#2423 an adapter claims only a shape it can positively identify", () => {
+	it("ignores an unrelated tool that carries an `operations` array", () => {
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "run_migrations",
+				input: {
+					path: "/src/file.ts",
+					operations: [{ name: "backfill" }, { name: "reindex" }],
+				},
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toBeUndefined();
+		expect(logReadGuardEvent).not.toHaveBeenCalledWith(
+			expect.objectContaining({ event: "edit_preflight_blocked" }),
+		);
+	});
+
+	it("ignores a navigation tool that carries `anchor` and `direction`", () => {
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "scroll_to",
+				input: { path: "/src/file.ts", anchor: "aB3", direction: "after" },
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toBeUndefined();
+		expect(logReadGuardEvent).not.toHaveBeenCalledWith(
+			expect.objectContaining({ event: "edit_preflight_blocked" }),
+		);
+	});
+
+	it("ignores a `replace`-named tool with no replacement_lines", () => {
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "replace",
+				input: { path: "/src/file.ts", remove_from: "aB3", remove_to: "cD4" },
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toBeUndefined();
+	});
+
+	it("still claims — and still blocks — a readmap batch with a real op", () => {
+		// The positive control for the tightening: a batch that DOES carry a
+		// recognized hashline operation is claimed, and a malformed anchor inside
+		// it still blocks, because there the shape is not in doubt.
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "hashline_edit",
+				input: {
+					path: "/src/file.ts",
+					operations: [{ set_line: { anchor: "not-a-line" } }],
+				},
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toContain("BLOCKED");
+		expect(logReadGuardEvent).toHaveBeenCalledWith(
+			expect.objectContaining({
+				event: "edit_preflight_blocked",
+				metadata: expect.objectContaining({ source: "hashline_edit" }),
+			}),
+		);
+	});
+});
+
+describe("#2423 the read-before-edit guard covers a third-party edit tool", () => {
+	it("blocks an unread `replace` and allows it after the range is read", () => {
+		const env = setupTestEnvironment("pi-lens-2423-guard-");
+		try {
+			const { filePath, anchorFor, lineCount } = writeHashlineFixture(
+				env.tmpDir,
+				"guarded.ts",
+				"manyBlanks",
+			);
+			// The guard treats a file whose mtime is at or after its own
+			// sessionStartMs as authored this session and lets the edit through.
+			// A same-millisecond write would therefore make this test allow for a
+			// reason that has nothing to do with the tool name — age the file so
+			// the assertion is about read coverage only.
+			const beforeSession = new Date(Date.now() - 60_000);
+			fs.utimesSync(filePath, beforeSession, beforeSession);
+
+			const unread = new ReadGuard("guard-2423-unread", { mode: "block" });
+			const { touchedLines } = getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: anchorFor(12),
+						remove_to: anchorFor(14),
+						replacement_lines: ["const x = 1;"],
+					},
+				},
+				filePath,
+			);
+			expect(touchedLines).toEqual([12, 14]);
+			expect(unread.checkEdit(filePath, touchedLines).action).toBe("block");
+
+			// Positive control: the same call is allowed once the agent has read
+			// those lines, so the block above is about coverage, not about the
+			// tool name being unfamiliar.
+			const read = new ReadGuard("guard-2423-read", { mode: "block" });
+			read.recordRead({
+				filePath,
+				requestedOffset: 1,
+				requestedLimit: lineCount,
+				effectiveOffset: 1,
+				effectiveLimit: lineCount,
+				expandedByLsp: false,
+				turnIndex: 1,
+				writeIndex: 0,
+				timestamp: Date.now(),
+			});
+			expect(read.checkEdit(filePath, touchedLines).action).toBe("allow");
+		} finally {
+			env.cleanup();
+		}
 	});
 });

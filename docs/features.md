@@ -53,6 +53,43 @@ so the final state is formatter-stable. A `write` immediately followed by an
 deferred too. See `clients/pipeline.ts`, `clients/runtime-tool-result.ts`, and
 `clients/runtime-agent-end.ts`.
 
+A tool pi-lens does not name is classified by the SHAPE of its arguments
+(`clients/mutating-tool.ts`). A host or extension edit tool called `replace` or
+`insert` therefore gets a turn-state entry, a change-log receipt attributed to
+the tool itself, and the deferred autofix and format pass — the same chain
+`edit` gets. Its lines are resolved when the anchor is unambiguous (roughly
+two-thirds of anchors in practice — `clients/hashline-anchor.ts`); otherwise
+the mutation is recorded whole-file with lines unknown, and the
+read-before-edit guard takes its no-line-info arm rather than guessing.
+Deferred is the default for any edit-shaped tool pi-lens cannot place, because
+formatting between the calls of a multi-step rewrite fights the tool that is
+still writing. A tool whose SHAPE is unrecognized too is caught by observation:
+pi-lens takes a bounded snapshot of the path that call names — and only that
+path, so a change to a neighbouring file is never blamed on it — replays
+whatever actually changed through the same chain, then remembers that tool as
+mutating for the session, and on disk under the project's data directory once a
+second observation confirms it, so later sessions classify it by name with no
+snapshot at all. A tool that names no file is caught at `agent_settled` by an
+incremental content check over the files pi-lens has already read, written,
+diagnosed or opened on a language server: a rotating window of the set each
+turn, reading only the files whose size or timestamp actually moved, so the
+check stays affordable as the set grows. A file it has never seen has no
+baseline and is therefore not covered, and a file it cannot verify is named
+rather than reformatted on a timestamp alone
+(`clients/observed-mutation.ts`).
+
+**Bundled fallback lint configs stay conservative.** When a project ships no
+tool config, the package-owned fallback configs set the rules (`config/biome/core.jsonc`,
+`config/ruff/core.toml`, `config/markdownlint/core.json`). The biome fallback
+disables `useImportType`: its safe fix rewrites a value import used only in
+type positions into `import type`, which erases the runtime binding that
+experimental decorator metadata (`emitDecoratorMetadata`) still needs and
+breaks decorator-based dependency injection (refs #2385). Every other
+recommended rule stays on, and an explicit project `biome.json(c)` remains
+authoritative: if you enable `useImportType` there, pi-lens does not override
+it. The ruff fallback selects no flake8-type-checking (TC) rules and applies
+only safe fixes, so it never hoists imports into `TYPE_CHECKING` blocks.
+
 Deferred formatting (the `agent_end` default) runs with **bounded
 concurrency**: at most three formatter subprocesses in flight at once, with
 results applied in admission order and cooperative yields between files, so a

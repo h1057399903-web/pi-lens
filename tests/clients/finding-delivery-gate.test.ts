@@ -74,6 +74,7 @@ const EXPECTED_SURFACE_IDS = [
 	"lens-diagnostics:mode-delta",
 	"widget-state:footer",
 	"agent-nudge:context-message",
+	"test-runner-delivery:custom-entry",
 	"project-diagnostics:persisted-snapshot",
 	// #2028: the remaining agent-facing surfaces.
 	"tool-call:stop-blocker",
@@ -82,6 +83,9 @@ const EXPECTED_SURFACE_IDS = [
 	"read-guard-tool-lines:preflight-errors",
 	"agent-behavior:thrashing-notice",
 	"tool-call:duplicate-export-blocker",
+	// #2423: the shape adapters promoted out of `read-guard-tool-lines.ts` carry
+	// their blocking preflight text with them.
+	"mutating-tool:adapter-preflight-errors",
 	// #2007: the shared-checkout refusal, the same live-preflight shape as
 	// `git-guard:commit-blocked`.
 	"shared-checkout-guard:worktree-mutation-blocked",

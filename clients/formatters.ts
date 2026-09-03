@@ -14,8 +14,13 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { BoundedLruCache } from "./bounded-cache.js";
+import { createGenerationSource } from "./generation-guard.js";
 import { normalizeMapKey } from "./path-utils.js";
+import { resolveCargoPackageEdition } from "./cargo-manifest.js";
+import { resolveKtfmtGradleStyle } from "./gradle-ktfmt-style.js";
+import { resolvePhpCsFixerConfig } from "./php-cs-fixer-config.js";
 import { TERRAGRUNT_FILENAMES } from "./file-kinds.js";
+import { stripAnsi } from "./sanitize.js";
 import {
 	detectIndentation,
 	hasDetectableIndentation,
@@ -99,7 +104,25 @@ export async function tryLazyInstallFormatterTool(
  * stock command there is exactly the stock-style imposition the fix bans.
  */
 export const SKIP_FORMATTING = "skip-formatting" as const;
-export type ResolvedFormatterCommand = string[] | null | typeof SKIP_FORMATTING;
+
+/**
+ * Sentinel a `resolveCommand` returns when it has PROVEN the selected
+ * formatter has no executable — the binary is absent from every place the
+ * resolver probed (node_modules/.bin, a venv, a managed install dir, PATH) and
+ * no alternative resolved (#2413). Distinct from `null` ("no override, fall
+ * back to the static `command`") and from SKIP_FORMATTING ("style-preserving
+ * refusal"): the static fallback for these formatters is the SAME bare binary
+ * the resolver just proved missing, so spawning it only re-triggers the ENOENT
+ * the resolver already observed — and reporting that as a formatting failure is
+ * the exact defect this fixes (recurring defect shape 10: an unavailable
+ * producer collapsed into an ordinary failed result).
+ */
+export const FORMATTER_UNAVAILABLE = "formatter-unavailable" as const;
+export type ResolvedFormatterCommand =
+	| string[]
+	| null
+	| typeof SKIP_FORMATTING
+	| typeof FORMATTER_UNAVAILABLE;
 
 /**
  * #1940: what formatter selection actually did to answer one file.
@@ -157,10 +180,40 @@ export interface FormatterInfo {
 	lenientStatuses?: number[];
 }
 
+/**
+ * Bounded outcome discriminator for one formatter run (#2413).
+ *
+ * `success`/`changed` alone cannot separate "the tool is not installed" from
+ * "the tool ran and failed" — both used to arrive as `success: false`, so an
+ * unavailable formatter was counted as a failed file, requeued on every
+ * agent_end, and left a red `fmt-failed` footer marker. This field is the
+ * single typed seam every downstream consumer (widget footer, deferred drain,
+ * latency logs) reads to keep the two apart.
+ *
+ *   - `formatted`   — ran, rewrote the file.
+ *   - `unchanged`   — ran, file already conformant.
+ *   - `skipped`     — style-preserving refusal or trust-gated npx fallback.
+ *   - `unavailable` — the executable is absent; NOT a code failure.
+ *   - `failed`      — a real failure (timeout, bad config, parse error,
+ *                     undocumented nonzero exit).
+ */
+export type FormatterOutcomeKind =
+	| "formatted"
+	| "unchanged"
+	| "skipped"
+	| "unavailable"
+	| "failed";
+
 export interface FormatterResult {
 	success: boolean;
 	changed: boolean;
 	error?: string;
+	/**
+	 * Typed outcome kind (#2413). Required so every producer must declare which
+	 * bucket a run fell into — an `unavailable` result can never silently
+	 * masquerade as a `failed` one.
+	 */
+	outcome: FormatterOutcomeKind;
 }
 
 // --- Utility Functions ---
@@ -183,11 +236,44 @@ async function findUp(
 	let currentDir = startDir;
 
 	while (currentDir !== stopDir) {
-		for (const target of targets) {
-			const checkPath = path.join(currentDir, target);
-			if (await fileExists(checkPath)) {
-				found.push(checkPath);
+		// One `readdir` per directory instead of one `access` per target: the
+		// per-target probe made this loop's cost O(targets), so a long target
+		// list (e.g. `FORMATTER_CONFIG_FILES`) paid for every entry at every
+		// ancestor directory even when almost none of them exist (#1603).
+		let entries: string[];
+		try {
+			entries = await fs.readdir(currentDir);
+		} catch {
+			entries = [];
+		}
+		if (entries.length > 0) {
+			// On default-case-insensitive platforms the old `fs.access` probe
+			// matched a config file regardless of on-disk casing; fold so the
+			// readdir membership check keeps that behavior.
+			const foldCase =
+				process.platform === "win32" || process.platform === "darwin";
+			const entrySet = new Set(
+				foldCase ? entries.map((e) => e.toLowerCase()) : entries,
+			);
+			for (const target of targets) {
+				// Nested candidates (for example node_modules/.bin/biome) do
+				// not appear as direct readdir members. They retain the old
+				// bounded candidate probe; direct names use the O(depth + matches)
+				// directory-membership path above.
+				if (target.includes("/") || target.includes("\\")) continue;
+				if (entrySet.has(foldCase ? target.toLowerCase() : target)) {
+					const candidate = path.join(currentDir, target);
+					// Directory membership is only a cheap candidate filter. Keep the
+					// old access check for matched entries so dangling links and entries
+					// that cannot be read do not become config evidence (#1603 R2).
+					if (await fileExists(candidate)) found.push(candidate);
+				}
 			}
+		}
+		for (const target of targets) {
+			if (!target.includes("/") && !target.includes("\\")) continue;
+			const candidate = path.join(currentDir, target);
+			if (await fileExists(candidate)) found.push(candidate);
 		}
 		const parent = path.dirname(currentDir);
 		if (parent === currentDir) break;
@@ -195,6 +281,15 @@ async function findUp(
 	}
 
 	return found;
+}
+
+/** Test-only access to the real filesystem walker and its candidate filter. */
+export function _findUpForTests(
+	targets: string[],
+	startDir: string,
+	stopDir?: string,
+): Promise<string[]> {
+	return findUp(targets, startDir, stopDir);
 }
 
 const WHICH_BUDGET_MS = 5000;
@@ -939,7 +1034,11 @@ export const oxfmtFormatter: FormatterInfo = {
 		if (local) return [local, OXFMT_NO_ERROR_ON_UNMATCHED, filePath];
 		const found = await which("oxfmt");
 		if (found) return [found, OXFMT_NO_ERROR_ON_UNMATCHED, filePath];
-		return null;
+		// #2413: neither node_modules/.bin nor PATH has oxfmt, and `detect()` is
+		// config-only (it never probes the binary), so selection can reach here
+		// with nothing installed. The static command is bare `oxfmt` — spawning it
+		// only reproduces the reported `spawn oxfmt ENOENT`. Prove it unavailable.
+		return FORMATTER_UNAVAILABLE;
 	},
 	// Single source of truth: OXFMT_SUPPORTED_EXTENSIONS in tool-policy.ts.
 	// Do not hand-maintain a second copy of this list (#1134 — previously two
@@ -975,7 +1074,12 @@ export const ruffFormatter: FormatterInfo = {
 		const { ensureTool } = await import("./installer/index.js");
 		const installed = await ensureTool(toolId);
 		if (installed) return [installed, ...args, filePath];
-		return null;
+		// #2413: `ensureTool` already resolves PATH, global bins and the managed
+		// dir (and attempts an install) before returning falsy, so reaching here
+		// means ruff is genuinely nowhere. `detect()`'s `hasRuffConfig` branch has
+		// no binary check, so a config-only project selects ruff with nothing
+		// installed; the static bare `ruff` would then ENOENT. Prove it unavailable.
+		return FORMATTER_UNAVAILABLE;
 	},
 	async detect(cwd: string) {
 		if (hasRuffConfig(cwd)) return true;
@@ -1039,6 +1143,17 @@ export const rustfmtFormatter: FormatterInfo = {
 	name: "rustfmt",
 	command: ["rustfmt", "$FILE"],
 	extensions: [".rs"],
+	// #2466: rustfmt defaults to an OLDER edition than the file's actual Cargo
+	// package when invoked bare, so it can reject valid newer-edition syntax
+	// (e.g. Rust 2024). Carry the nearest package's `edition` (honoring
+	// `edition.workspace = true` inheritance) through `--edition`; `undefined`
+	// (unreadable/unparseable manifest) falls back to the static command
+	// above, unchanged from pre-#2466 behavior.
+	async resolveCommand(filePath, _cwd) {
+		const edition = await resolveCargoPackageEdition(filePath);
+		if (edition === undefined) return null;
+		return ["rustfmt", "--edition", edition, filePath];
+	},
 	async detect(cwd: string) {
 		if ((await which("rustfmt")) !== null) return true;
 		// If we're in a Rust project, attempt one lazy install of rustfmt component.
@@ -1163,12 +1278,26 @@ export const ktfmtFormatter: FormatterInfo = {
 	// ktfmt formats in place when given a file path (no flag needed).
 	command: ["ktfmt", "$FILE"],
 	extensions: [".kt", ".kts"],
+	// #2468: ktfmt's CLI never reads a project's Gradle `ktfmt { googleStyle()
+	// | kotlinLangStyle() }` selection — style is CLI-flag-only
+	// (`--google-style`/`--kotlinlang-style`, verified against ktfmt v0.63's
+	// own arg parser). Carry the nearest module's declared style through;
+	// `undefined` (no declaration, unreadable/unparseable manifest, or an
+	// unsupported style like the removed `dropboxStyle()`) falls back to the
+	// bare invocation, unchanged from pre-#2468 behavior.
 	async resolveCommand(filePath, _cwd) {
+		const styleFlag = await resolveKtfmtGradleStyle(filePath);
 		const inPath = await which("ktfmt");
-		if (inPath) return [inPath, filePath];
+		if (inPath)
+			return styleFlag ? [inPath, styleFlag, filePath] : [inPath, filePath];
 		const { ensureTool } = await import("./installer/index.js");
 		const installed = await ensureTool("ktfmt");
-		return installed ? [installed, filePath] : null;
+		// #2413: which() and ensureTool (PATH/global/managed + install) both
+		// failed, and `detect()` gates only on hasKtfmtConfig — no binary probe —
+		// so a config-only project reaches here with ktfmt absent. The static
+		// command is bare `ktfmt`; spawning it reproduces the ENOENT class.
+		if (!installed) return FORMATTER_UNAVAILABLE;
+		return styleFlag ? [installed, styleFlag, filePath] : [installed, filePath];
 	},
 	async detect(cwd: string) {
 		// Opt-in only: ktfmt becomes the formatter when the project elects it,
@@ -1258,16 +1387,48 @@ export const phpCsFixerFormatter: FormatterInfo = {
 	name: "php-cs-fixer",
 	command: ["php-cs-fixer", "fix", "$FILE"],
 	extensions: [".php"],
+	// #2472: php-cs-fixer does NOT walk up parent directories looking for its
+	// own config the way prettier/biome/eslint do (verified against upstream
+	// `computeConfigFiles()` — see `resolvePhpCsFixerConfig`'s doc comment),
+	// and `formatFile` spawns with cwd = the FILE's own directory, which is
+	// not necessarily where the ancestor config `detect()` found actually
+	// lives. Always resolve the binary explicitly here (vendor/bin first,
+	// then global) rather than falling through to the static `command` above
+	// — that static command can never carry `--config`, so a config found at
+	// an ancestor would silently be dropped whenever the vendor lookup here
+	// missed but a global binary still resolved. `--config` is attached
+	// whenever a config resolves, even when it sits in the file's own
+	// directory (AC3): unlike the pre-#2472 code, correctness no longer
+	// depends on php-cs-fixer's own (nonexistent) upward search.
 	async resolveCommand(filePath, cwd) {
-		const vendor = await findInVendorBin("php-cs-fixer", cwd);
-		if (vendor) return [vendor, "fix", filePath];
-		return null;
+		const configPath = resolvePhpCsFixerConfig(filePath);
+		const binary =
+			(await findInVendorBin("php-cs-fixer", cwd)) ??
+			(await which("php-cs-fixer"));
+		// #2413/#2472 review F4: both probes (vendor/bin, then PATH) have
+		// PROVEN the binary is absent — returning `null` here would fall back
+		// to the static `command` above, which is the SAME bare
+		// `php-cs-fixer` this just failed to find, spawning it only to
+		// re-observe the ENOENT already known. Report the proven-missing
+		// state instead so `formatFile` skips the wasted spawn.
+		if (!binary) return FORMATTER_UNAVAILABLE;
+		return configPath
+			? [binary, "fix", "--config", configPath, filePath]
+			: [binary, "fix", filePath];
 	},
 	async detect(cwd: string) {
 		const vendorBin = await findInVendorBin("php-cs-fixer", cwd);
 		const globalBin = await which("php-cs-fixer");
 		if (!vendorBin && !globalBin) return false;
-		// Only run if project has explicit config
+		// Only run if project has explicit config. This is a presence-only
+		// climb from the project `cwd` (not necessarily the formatted file's
+		// own directory) via this file's own `findUp` — deliberately NOT
+		// merged with `resolvePhpCsFixerConfig` above (#2472 AC4): that
+		// resolver climbs from the FILE's directory and needs the exact
+		// winning path for `--config`, while this only needs a yes/no answer
+		// from whatever `cwd` the caller passed. `rustfmtFormatter.detect`
+		// keeps the same non-merged shape against `resolveCargoPackageEdition`
+		// for the identical reason.
 		const configs = [".php-cs-fixer.php", ".php-cs-fixer.dist.php"];
 		const found = await findUp(configs, cwd);
 		return found.length > 0;
@@ -1548,10 +1709,19 @@ const detectionCache = new BoundedLruCache<
 	string,
 	{ signature: string; entries: Map<string, string[]> }
 >(32);
+// The signature is immutable for a cache generation. This memo is separate
+// from detectionCache because a cwd can have several extension entries, and a
+// warm lookup must not repeat the ancestor walk or stat matched configs.
+const formatterSignatureFlights = new Map<
+	string,
+	{ promise: Promise<string> }
+>();
+const formatterCacheGeneration = createGenerationSource("formatter-cache");
 
 // These are the formatter configuration files consulted by the policy helpers
-// above. Their metadata is part of detection cache identity: changing a file
-// must re-run detection even when PATH and installed tools are unchanged. A
+// above. Their metadata is captured by the cold detection signature. The
+// write-result seam invalidates that signature when a config path changes, so
+// detection re-runs even when PATH and installed tools are unchanged. A
 // filename a `has*Config` check reads but this list omits is invisible to the
 // cache: the signature never moves when that file is added, so a project that
 // opts in AFTER the first `getFormattersForFile` call for its cwd keeps
@@ -1655,6 +1825,21 @@ async function formatterConfigSignature(cwd: string): Promise<string> {
 	return parts.join("|");
 }
 
+async function getFormatterConfigSignature(
+	cwd: string,
+	normalizedCwd: string,
+): Promise<string> {
+	const existing = formatterSignatureFlights.get(normalizedCwd);
+	if (existing) return existing.promise;
+	const promise = formatterConfigSignature(cwd).finally(() => {
+		const current = formatterSignatureFlights.get(normalizedCwd);
+		if (current?.promise === promise)
+			formatterSignatureFlights.delete(normalizedCwd);
+	});
+	formatterSignatureFlights.set(normalizedCwd, { promise });
+	return promise;
+}
+
 // --- Public API ---
 
 export async function getFormattersForFile(
@@ -1673,33 +1858,20 @@ export async function getFormattersForFile(
 		? `${normalizedCwd}:${ext}:${base}`
 		: `${normalizedCwd}:${ext}`;
 
-	const configSignature = await formatterConfigSignature(cwd);
-	// Check cache
+	// A warm entry is authoritative until the write-result seam invalidates its
+	// config path. This is the only way to make the warm path free of config
+	// polling while still reacting immediately to pi-authored create/remove/
+	// change events. External editor changes remain a documented session-boundary
+	// limitation, like other write-result-owned freshness seams.
 	let cached = detectionCache.get(normalizedCwd);
-	if (cached && cached.signature !== configSignature) {
-		// An EXISTING entry whose signature moved is the user telling us the world
-		// changed. Re-probe PATH too, so "install the tool, touch the config" still
-		// works within one session now that a durable absence latches (#1495).
-		// Scoped to a real change on purpose: keying this off "no entry yet" would
-		// drop every PATH verdict on the first save in each new directory, which in
-		// a monorepo means re-probing forever.
-		detectionCache.delete(normalizedCwd);
-		cached = undefined;
-		resetWhichLatches();
-	}
-	if (!cached) {
-		cached = { signature: configSignature, entries: new Map() };
-		detectionCache.set(normalizedCwd, cached);
-	}
-
-	if (cached.entries.has(cacheKey)) {
+	if (cached?.entries.has(cacheKey)) {
 		const enabledNames = cached.entries.get(cacheKey);
 		const selectedFormatterName =
 			enabledNames && enabledNames.length > 0 ? enabledNames[0] : null;
 		logLatency({
 			type: "phase",
 			phase: "formatter_selected",
-			filePath: filePath,
+			filePath,
 			durationMs: 0,
 			metadata: {
 				formatter: selectedFormatterName,
@@ -1710,8 +1882,28 @@ export async function getFormattersForFile(
 			},
 		});
 		if (!enabledNames || enabledNames.length === 0) return [];
-		// Return cached formatters by name (preserves priority order)
 		return ALL_FORMATTERS.filter((f) => enabledNames.includes(f.name));
+	}
+	if (!cached) {
+		const generation = formatterCacheGeneration.capture();
+		const configSignature = await getFormatterConfigSignature(
+			cwd,
+			normalizedCwd,
+		);
+		// An invalidation can happen while the first signature walk is in flight.
+		// Do not publish a pre-invalidation signature into the new generation.
+		if (!generation.isCurrent()) {
+			return getFormattersForFile(filePath, cwd);
+		}
+		// Another cold caller for this cwd can finish the shared signature flight
+		// first. Re-read the LRU before installing an object so the later caller
+		// merges its extension entry into the existing object instead of replacing
+		// the earlier entry.
+		cached = detectionCache.get(normalizedCwd);
+		if (!cached) {
+			cached = { signature: configSignature, entries: new Map() };
+			detectionCache.set(normalizedCwd, cached);
+		}
 	}
 
 	// Detect formatters for this extension (or exact filename, e.g. terragrunt.hcl)
@@ -1885,7 +2077,11 @@ export async function getFormattersForFile(
 
 	// Store the list of enabled formatter names in cache
 	const enabledNames = enabled.map((f) => f.name);
-	cached.entries.set(cacheKey, enabledNames);
+	// An invalidation may have removed or replaced this object while detection
+	// awaited a tool probe. Never repopulate the old generation.
+	if (detectionCache.get(normalizedCwd) === cached) {
+		cached.entries.set(cacheKey, enabledNames);
+	}
 	return enabled;
 }
 
@@ -1900,8 +2096,23 @@ export async function getFormattersForFile(
  * therefore re-arms every directory EXCEPT the one the user is working in.
  */
 export function clearFormatterCache(): void {
+	formatterCacheGeneration.bump();
+	formatterSignatureFlights.clear();
 	detectionCache.clear();
 	resetWhichLatches();
+}
+
+const formatterConfigBasenames = new Set(
+	FORMATTER_CONFIG_FILES.map((fileName) => fileName.toLowerCase()),
+);
+
+/** Invalidate selection when the write-result seam reports a config path. */
+export function invalidateFormatterCacheForPath(filePath: string): void {
+	const basename = filePath.includes("\\")
+		? path.win32.basename(filePath)
+		: path.basename(filePath);
+	if (!formatterConfigBasenames.has(basename.toLowerCase())) return;
+	clearFormatterCache();
 }
 
 /**
@@ -1930,8 +2141,7 @@ export function _getFormatterResetStateForTests(): {
 }
 
 export function clearFormatterRuntimeState(): void {
-	detectionCache.clear();
-	resetWhichLatches();
+	clearFormatterCache();
 	// NO `resetLazyInstallAttempts()` here (#1537 review F1). This function runs
 	// from `resetFormatService()`, which `handleTurnEnd` calls every turn — so
 	// clearing the lazy-install hold here made "held for the session" mean "held
@@ -1939,11 +2149,6 @@ export function clearFormatterRuntimeState(): void {
 	// is `session_start`'s block in runtime-session.ts.
 }
 
-// ESC is built via fromCharCode so no raw control byte sits in the source.
-const ANSI_ESCAPE = new RegExp(
-	`${String.fromCharCode(27)}\\[[0-9;]*[A-Za-z]`,
-	"g",
-);
 const BOX_DRAWING_GLOBAL = /[\u2500-\u257F]/g;
 const HAS_BOX_DRAWING = /[\u2500-\u257F]/;
 
@@ -1963,7 +2168,7 @@ export function firstDiagnosticLine(
 	text: string | undefined,
 ): string | undefined {
 	for (const raw of (text ?? "").split("\n")) {
-		const line = raw.replace(ANSI_ESCAPE, "").trimEnd();
+		const line = stripAnsi(raw).trimEnd();
 		const stripped = line.replace(BOX_DRAWING_GLOBAL, "").trim();
 		if (!stripped) continue;
 		// "format ━━━━━━━━" is a section banner, not a diagnostic. Require a rule
@@ -1986,11 +2191,16 @@ async function resolveFormatterCommand(
 	formatter: FormatterInfo,
 	absolutePath: string,
 	cwd: string,
-): Promise<string[] | typeof SKIP_FORMATTING> {
+): Promise<string[] | typeof SKIP_FORMATTING | typeof FORMATTER_UNAVAILABLE> {
 	const resolved = formatter.resolveCommand
 		? await formatter.resolveCommand(absolutePath, cwd)
 		: null;
 	if (resolved === SKIP_FORMATTING) return SKIP_FORMATTING;
+	// The resolver proved the executable absent — DO NOT fall through to the
+	// static bare command, which is the same binary it just probed and missing
+	// (#2413). The caller turns this into a typed `unavailable` outcome, never a
+	// spawn and never a failure.
+	if (resolved === FORMATTER_UNAVAILABLE) return FORMATTER_UNAVAILABLE;
 	if (resolved !== null) return resolved;
 	const fallback = formatter.command.map((c) =>
 		c.replace("$FILE", absolutePath),
@@ -2026,13 +2236,41 @@ export async function formatFile(
 		if (cmd === SKIP_FORMATTING) {
 			// Style-preserving refusal (#1144): no repo config and no detectable
 			// indentation to pin — formatting would impose the tool's stock style.
-			return { success: true, changed: false };
+			return { success: true, changed: false, outcome: "skipped" };
+		}
+		if (cmd === FORMATTER_UNAVAILABLE) {
+			// The resolver proved the executable absent (#2413): the oxfmt ENOENT
+			// trap and its siblings. This is unavailable infrastructure, not a code
+			// failure — success stays true so it is never counted as a failed file
+			// or requeued, and the typed outcome keeps it out of the failure bucket.
+			return {
+				success: true,
+				changed: false,
+				outcome: "unavailable",
+				error: `${formatter.name}: formatter executable not found`,
+			};
 		}
 		// Run formatter without blocking the event loop.
 		const result = await safeSpawnAsync(cmd[0], cmd.slice(1), {
 			timeout: 15000,
 			cwd,
 		});
+
+		// A resolver that could NOT prove absence (it never probed PATH — e.g.
+		// black/sqlfluff, which only look in a venv) legitimately falls back to the
+		// bare static command. When that bare command is missing, the spawn boundary
+		// reports a typed `tool-not-found` failure — never a nonzero exit. Treat it
+		// as unavailable, not a formatting failure, closing the same #2413 class for
+		// the formatters whose `null` correctly means "static untried" (no
+		// oxfmt-specific string matching — this reads the typed spawn-failure kind).
+		if (result.spawnFailure?.kind === "tool-not-found") {
+			return {
+				success: true,
+				changed: false,
+				outcome: "unavailable",
+				error: result.spawnFailure.message,
+			};
+		}
 
 		// Strict by default (#1337): only a formatter with a documented
 		// benign-nonzero mode (`lenientExitCode`) may exit nonzero and still be
@@ -2047,6 +2285,7 @@ export async function formatFile(
 			return {
 				success: false,
 				changed: false,
+				outcome: "failed",
 				error:
 					result.error?.message ||
 					firstDiagnosticLine(result.stderr) ||
@@ -2065,11 +2304,13 @@ export async function formatFile(
 		return {
 			success: true,
 			changed,
+			outcome: changed ? "formatted" : "unchanged",
 		};
 	} catch (err) {
 		return {
 			success: false,
 			changed: false,
+			outcome: "failed",
 			error: err instanceof Error ? err.message : String(err),
 		};
 	}

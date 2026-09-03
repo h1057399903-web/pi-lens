@@ -15,6 +15,7 @@
  *   - a corrupt cache file fails open (still resolves, doesn't throw).
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { gunzipSync } from "node:zlib";
@@ -79,7 +80,7 @@ function setStartupMode(mode: "full" | "quick"): () => void {
 }
 
 function makeDeps(ctxCwd: string, dbg: (msg: string) => void = () => {}) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify: vi.fn(),
@@ -124,7 +125,7 @@ function makeDeps(ctxCwd: string, dbg: (msg: string) => void = () => {}) {
 		cleanStaleTsBuildInfo: () => [],
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
-	} as any;
+	}) as any;
 }
 
 describe("startup-scan verdict cache in session_start (#699)", () => {
@@ -174,7 +175,7 @@ describe("startup-scan verdict cache in session_start (#699)", () => {
 			expect(logLatencySpy).toHaveBeenCalledWith(
 				expect.objectContaining({
 					phase: "session_start_total",
-					metadata: { mode: "full" },
+					metadata: { mode: "full", sameRoot: "unknown" },
 				}),
 			);
 			const totalEntry = logLatencySpy.mock.calls
@@ -300,7 +301,7 @@ describe("startup-scan verdict cache in session_start (#699)", () => {
 			expect(logLatencySpy).toHaveBeenCalledWith(
 				expect.objectContaining({
 					phase: "session_start_total",
-					metadata: { mode: "quick" },
+					metadata: { mode: "quick", sameRoot: "unknown" },
 				}),
 			);
 		} finally {

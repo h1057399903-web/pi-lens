@@ -29,11 +29,20 @@ function tmpDir(prefix: string): string {
 	return dir;
 }
 
-afterEach(() => {
+afterEach(async () => {
 	vi.restoreAllMocks();
 	for (const dir of dirs.splice(0)) removeTempDirSync(dir);
 	if (defaultGlobalDir === undefined) delete process.env.PI_LENS_HOME;
 	else process.env.PI_LENS_HOME = defaultGlobalDir;
+	// #2418 review round 3, S3. The ignored-config warn latch is
+	// process-lifetime and shared by all three loaders, so without an explicit
+	// clear these cases only stayed independent because every fixture happened
+	// to land in a fresh mkdtemp path — a property of the fixture, not of the
+	// test. The loader now exports the same reset seam lens-config and
+	// project-lens-config do.
+	const { resetLSPConfigWarnCache } =
+		await import("../../../clients/lsp/config.js");
+	resetLSPConfigWarnCache();
 });
 
 describe("loadLSPConfig global configuration (#870)", () => {
@@ -143,6 +152,62 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		);
 	});
 
+	it("does not leak a token from a malformed config into the warning (#2431)", async () => {
+		// The literal shape from #2431's evidence: Node's own JSON.parse
+		// SyntaxError embeds a slice of the source text, so an unquoted value
+		// next to a real-shaped credential leaked straight through as `reason`
+		// before this fix.
+		const TOKEN = `ghp_${"A".repeat(36)}`;
+		const projectDir = tmpDir("pi-lens-lsp-project-");
+		const globalDir = tmpDir("pi-lens-lsp-global-");
+		process.env.PI_LENS_HOME = globalDir;
+		fs.writeFileSync(path.join(globalDir, "lsp.json"), `{"piToken": ${TOKEN}}`);
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const { loadLSPConfig } = await import("../../../clients/lsp/config.js");
+		await expect(loadLSPConfig(projectDir)).resolves.toEqual({});
+		expect(error).toHaveBeenCalledTimes(1);
+		const [message] = error.mock.calls[0];
+		expect(message).not.toContain(TOKEN);
+		expect(message).not.toContain("ghp_");
+
+		const { getDegradationSummary } =
+			await import("../../../clients/degradation-ledger.js");
+		const group = getDegradationSummary().find(
+			(g) => g.kind === "config-ignored",
+		);
+		const globalConfigPath = path.join(globalDir, "lsp.json");
+		const ledgerEntry = group?.latestReasons.find(
+			(entry) => entry.subject === globalConfigPath,
+		);
+		expect(ledgerEntry).toBeDefined();
+		expect(ledgerEntry?.reason).not.toContain(TOKEN);
+		expect(ledgerEntry?.reason).not.toContain("ghp_");
+	});
+
+	it("warns once per broken file, and again after the latch is reset", async () => {
+		// The seam S3 asks for, exercised rather than merely exported: the same
+		// path read twice nags once, and a caller that explicitly re-arms the
+		// latch (a new session's test, or this file's own afterEach) sees it
+		// again. Nothing here relies on the fixture path being unique.
+		const projectDir = tmpDir("pi-lens-lsp-project-");
+		const globalDir = tmpDir("pi-lens-lsp-global-");
+		process.env.PI_LENS_HOME = globalDir;
+		fs.writeFileSync(path.join(globalDir, "lsp.json"), "{ invalid");
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const { loadLSPConfig, resetLSPConfigWarnCache } =
+			await import("../../../clients/lsp/config.js");
+		resetLSPConfigWarnCache();
+		await loadLSPConfig(projectDir);
+		await loadLSPConfig(projectDir);
+		expect(error).toHaveBeenCalledTimes(1);
+
+		resetLSPConfigWarnCache();
+		await loadLSPConfig(projectDir);
+		expect(error).toHaveBeenCalledTimes(2);
+	});
+
 	it("treats a missing global file as a silent no-op", async () => {
 		const projectDir = tmpDir("pi-lens-lsp-project-");
 		process.env.PI_LENS_HOME = tmpDir("pi-lens-lsp-global-");
@@ -151,6 +216,77 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		const { loadLSPConfig } = await import("../../../clients/lsp/config.js");
 		await expect(loadLSPConfig(projectDir)).resolves.toEqual({});
 		expect(error).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * #2426, at the public loader rather than at the resolver seam.
+ *
+ * Both cases below are RED on pre-#2426 `loadLSPConfig`: the walk ran to the
+ * filesystem root with no `$HOME` stop, and the candidate list took the first
+ * hit, which put a deprecated location ahead of the canonical one.
+ */
+describe("loadLSPConfig walk confinement and canonical precedence (#2426)", () => {
+	it("does not adopt a legacy LSP config from at or above HOME", async () => {
+		// Cross-form paths per the read-guard path-key rule: the ceiling is
+		// supplied in `/` form and the cwd in native form, so a ceiling that only
+		// holds when both were spelled the same way does not pass here.
+		const root = tmpDir("pi-lens-lsp-ceiling-");
+		const home = path.join(root, "home");
+		const projectDir = path.join(home, "proj", "src");
+		fs.mkdirSync(projectDir, { recursive: true });
+		process.env.PI_LENS_HOME = tmpDir("pi-lens-lsp-global-");
+
+		// Above HOME.
+		fs.mkdirSync(path.join(root, ".pi-lens"), { recursive: true });
+		fs.writeFileSync(
+			path.join(root, ".pi-lens", "lsp.json"),
+			JSON.stringify({ warmFiles: ["from-above-home"] }),
+		);
+		// And IN HOME, which is equally off limits.
+		fs.writeFileSync(
+			path.join(home, "pi-lsp.json"),
+			JSON.stringify({ warmFiles: ["from-home"] }),
+		);
+
+		const { loadLSPConfig } = await import("../../../clients/lsp/config.js");
+		await expect(
+			loadLSPConfig(projectDir, home.replace(/\\/g, "/")),
+		).resolves.toEqual({});
+
+		// Mutation guard: the same fixture with a config BELOW the ceiling is
+		// still read, so the two assertions above cannot pass by reading nothing.
+		fs.writeFileSync(
+			path.join(home, "proj", ".pi-lens.json"),
+			JSON.stringify({ lsp: { warmFiles: ["from-project"] } }),
+		);
+		await expect(
+			loadLSPConfig(projectDir, home.replace(/\\/g, "/")),
+		).resolves.toEqual({ warmFiles: ["from-project"] });
+	});
+
+	it("lets the canonical .pi-lens.json beat a leftover .pi-lens/lsp.json", async () => {
+		const root = tmpDir("pi-lens-lsp-canonical-");
+		const home = path.join(root, "home");
+		const projectDir = path.join(home, "proj");
+		fs.mkdirSync(path.join(projectDir, ".pi-lens"), { recursive: true });
+		process.env.PI_LENS_HOME = tmpDir("pi-lens-lsp-global-");
+
+		fs.writeFileSync(
+			path.join(projectDir, ".pi-lens", "lsp.json"),
+			JSON.stringify({ warmFiles: ["legacy"], disabledServers: ["typos"] }),
+		);
+		fs.writeFileSync(
+			path.join(projectDir, ".pi-lens.json"),
+			JSON.stringify({ lsp: { warmFiles: ["canonical"] } }),
+		);
+
+		const { loadLSPConfig } = await import("../../../clients/lsp/config.js");
+		const config = await loadLSPConfig(projectDir, home);
+		expect(config.warmFiles).toEqual(["canonical"]);
+		// The legacy file is still READ — deprecation, not removal — so a key the
+		// user has not migrated yet keeps working.
+		expect(config.disabledServers).toEqual(["typos"]);
 	});
 });
 

@@ -12,11 +12,11 @@
 
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	buildMemorySample,
 	collectMemorySampleSubsystems,
+	estimateDispatchCacheBytes,
 	formatMemoryHealthLine,
 	HEAP_GROWTH_TIGHTEN_RATIO,
 	isRapidHeapGrowth,
@@ -42,13 +42,8 @@ import {
 import { PathKeyedMap } from "../../clients/path-keyed-map.js";
 import { normalizeEphemeralMapKey } from "../../clients/path-utils.js";
 import { createLSPClient } from "../../clients/lsp/client.js";
-import { launchLSP, stopLSP } from "../../clients/lsp/launch.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../fixtures/fake-lsp-server.mjs",
-);
+import { stopLSP } from "../../clients/lsp/launch.js";
+import { spawnFakeLspServer } from "../support/fake-lsp-server.js";
 
 describe("shouldEmitMemorySample (cadence)", () => {
 	it("is false on turn 0 (nothing meaningful resident yet)", () => {
@@ -196,6 +191,24 @@ describe("collectMemorySampleSubsystems (O(1)/O(bounded-cache-size) live reads)"
 		expect(estimateReviewGraphStoreBytes(2, 3)).toBe(1630);
 	});
 
+	// #2282 review round F4: the session-fact entry count arrived as a
+	// count-only field, so `dispatchCaches.estimatedBytes` still omitted the
+	// whole sessionFacts footprint. Both counts now carry measured bytes.
+	it("attributes bytes to session-fact entries, not just the neighbor cache", () => {
+		expect(
+			estimateDispatchCacheBytes({
+				recentlyCleanNeighborCacheSize: 2,
+				sessionFactEntries: 1000,
+			}),
+		).toBe(440_640);
+		expect(
+			estimateDispatchCacheBytes({
+				recentlyCleanNeighborCacheSize: 0,
+				sessionFactEntries: 1000,
+			}),
+		).toBe(440_000);
+	});
+
 	it("wordIndex is null when none is supplied (no word index built yet this session)", () => {
 		const subsystems = collectMemorySampleSubsystems(null);
 		expect(subsystems.wordIndex).toBeNull();
@@ -289,7 +302,7 @@ describe("collectMemorySampleSubsystems (O(1)/O(bounded-cache-size) live reads)"
 		// `incrementalTextEntries`/`incrementalTextBytes` all read 0 whether or
 		// not the plumbing works. A real client with known retained text is the
 		// only way to prove a positive value flows through.
-		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		const proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			env: { ...process.env, FAKE_LSP_SYNC_KIND: "2" }, // Incremental
 		});

@@ -1,20 +1,27 @@
 import type { EditToolInput } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import {
 	hostWouldApplyOldText,
 	normalizeForGuardMatch,
 	normalizeToLF,
 	stripBom,
 } from "./host-edit-normalize.js";
-import type { PartiallyApplicableEdit } from "./partial-edit-apply.js";
+import { classifyMutatingTool } from "./mutating-tool.js";
 import {
-	boundedIndexesForCount,
+	isExactAppliedRetry,
+	type EditSnapshotIdentity,
+	type PartialApplyRecordStore,
+	type PartiallyApplicableEdit,
+} from "./partial-edit-apply.js";
+import {
+	boundedEditIndexes,
 	createReadGuardEditBatchSummary,
 	logReadGuardEvent,
 	type EditBatchRejection,
 	type ReadGuardEditBatchSummary,
 } from "./read-guard-logger.js";
-import { isToolCallEventType } from "./tool-event.js";
 
 export interface GuardLineResult {
 	touchedLines: [number, number] | undefined;
@@ -22,10 +29,20 @@ export interface GuardLineResult {
 	// When set, read-guard checks each range independently instead of the bounding box.
 	editRanges?: [number, number][];
 	preflightError?: string;
+	/** Composed header line of the blocking message (🔄/🛑/✅). */
+	preflightHeader?: string;
+	/**
+	 * Per-edit failure bodies. Callers recompose them around a commit-status
+	 * header, so committed bytes are never re-labelled by the preflight header
+	 * (#2402).
+	 */
+	preflightDetails?: string[];
 	// Edits that resolved successfully when only a subset failed preflight.
 	// Caller can apply these directly and return a ⚠️ PARTIAL APPLY message.
 	// Shares the host-pinned edit shape with applyPartiallyApplicableEdits.
 	partiallyApplicable?: PartiallyApplicableEdit[];
+	/** Edits recognized as exact retries of already-applied pairs (#2402). */
+	alreadyAppliedEdits?: number[];
 	/** Canonical bounded edit-batch telemetry, also reused by partial apply. */
 	editBatchSummary?: ReadGuardEditBatchSummary;
 	// All edits were resolved by exact content match — range snapshot staleness
@@ -34,12 +51,12 @@ export interface GuardLineResult {
 }
 
 // Track repeated oldtext_not_found failures per (filePath, preview) to escalate messages.
-const recentOldTextFailures = new Map<
+export const MAX_FAILURE_TRACKER_SIZE = 200;
+const recentOldTextFailures = new BoundedFifoMap<
 	string,
 	{ count: number; lastTs: number }
->();
+>(MAX_FAILURE_TRACKER_SIZE);
 const REPEAT_FAILURE_TTL_MS = 300_000;
-const MAX_FAILURE_TRACKER_SIZE = 200;
 
 function trackOldTextFailure(filePath: string, preview: string): number {
 	const key = `${filePath}::${preview}`;
@@ -47,12 +64,27 @@ function trackOldTextFailure(filePath: string, preview: string): number {
 	const prev = recentOldTextFailures.get(key);
 	const count =
 		prev && now - prev.lastTs < REPEAT_FAILURE_TTL_MS ? prev.count + 1 : 1;
-	if (recentOldTextFailures.size >= MAX_FAILURE_TRACKER_SIZE) {
-		const oldest = recentOldTextFailures.keys().next().value;
-		if (oldest !== undefined) recentOldTextFailures.delete(oldest);
-	}
 	recentOldTextFailures.set(key, { count, lastTs: now });
 	return count;
+}
+
+/** #2442 test-only: exercise the bounded failure tracker's capacity
+ *  eviction directly, without a full read-guard preflight call. */
+export function _trackOldTextFailureForTests(
+	filePath: string,
+	preview: string,
+): number {
+	return trackOldTextFailure(filePath, preview);
+}
+/** #2442 test-only: was this (filePath, preview) pair's escalation count
+ *  reset by capacity eviction? (A fresh `_trackOldTextFailureForTests` call
+ *  answering 1 again, after previously answering >1, means yes — but this
+ *  reads the tracker's residency directly instead.) */
+export function _hasOldTextFailureForTests(
+	filePath: string,
+	preview: string,
+): boolean {
+	return recentOldTextFailures.has(`${filePath}::${preview}`);
 }
 
 function findFirstLineOfOldText(
@@ -182,147 +214,44 @@ function lineNumberAt(content: string, index: number): number {
 	return content.substring(0, index).split("\n").length;
 }
 
-function parseHashlineAnchor(anchor: unknown): number | undefined {
-	if (typeof anchor !== "string") return undefined;
-	const trimmed = anchor.trim();
-	const separator = trimmed.indexOf(":");
-	const lineText = separator === -1 ? trimmed : trimmed.slice(0, separator);
-	if (!/^\d+$/.test(lineText)) return undefined;
-	const line = Number(lineText);
-	return Number.isInteger(line) && line > 0 ? line : undefined;
+/**
+ * Deduplicated overlapping pairs, in candidate order, for the overlap error
+ * message. Each overlapping edit appears in exactly one pair where possible;
+ * a chain (A-B-C all overlapping) reports A-B and A-C.
+ */
+function overlapPairs(
+	candidates: PartiallyApplicableEdit[],
+): Array<[PartiallyApplicableEdit, PartiallyApplicableEdit]> {
+	const pairs: Array<[PartiallyApplicableEdit, PartiallyApplicableEdit]> = [];
+	const reported = new Set<PartiallyApplicableEdit>();
+	for (let i = 0; i < candidates.length; i += 1) {
+		const a = candidates[i];
+		if (reported.has(a)) continue;
+		for (let j = i + 1; j < candidates.length; j += 1) {
+			const b = candidates[j];
+			if (reported.has(b)) continue;
+			if (b.spanStart < a.spanEnd && a.spanStart < b.spanEnd) {
+				pairs.push([a, b]);
+				reported.add(a);
+				reported.add(b);
+				break;
+			}
+		}
+	}
+	return pairs;
 }
 
-function combineRanges(ranges: [number, number][]): GuardLineResult {
-	const starts = ranges.map(([start]) => start);
-	const ends = ranges.map(([, end]) => end);
-	return {
-		touchedLines: [Math.min(...starts), Math.max(...ends)],
-		editRanges: ranges.length > 1 ? ranges : undefined,
-	};
-}
-
-function getHashlineOperations(input: Record<string, unknown>): unknown[] {
-	if (Array.isArray(input.operations)) return input.operations;
-	if (Array.isArray(input.ops)) return input.ops;
-	if (input.set_line || input.replace_lines || input.replace_symbol)
-		return [input];
-	return [];
-}
-
-function resolveHashlineEditInput(
-	input: Record<string, unknown>,
-	filePath: string | undefined,
-	sessionId: string | undefined,
-	correlationId?: string,
-): GuardLineResult | undefined {
-	const operations = getHashlineOperations(input);
-	if (operations.length === 0) return undefined;
-	const ranges: [number, number][] = [];
-	const errors: string[] = [];
-
-	for (let index = 0; index < operations.length; index += 1) {
-		const op = operations[index] as Record<string, unknown>;
-		if (op.set_line) {
-			const payload = op.set_line as Record<string, unknown>;
-			const line = parseHashlineAnchor(payload.anchor);
-			if (!line) {
-				errors.push(`operation[${index}].set_line.anchor is malformed`);
-				continue;
-			}
-			ranges.push([line, line]);
-			continue;
-		}
-		if (op.replace_lines) {
-			const payload = op.replace_lines as Record<string, unknown>;
-			const start = parseHashlineAnchor(payload.start_anchor);
-			const end = parseHashlineAnchor(payload.end_anchor);
-			if (!start || !end) {
-				errors.push(`operation[${index}].replace_lines anchors are malformed`);
-				continue;
-			}
-			if (start > end) {
-				errors.push(`operation[${index}].replace_lines range is inverted`);
-				continue;
-			}
-			ranges.push([start, end]);
-			continue;
-		}
-		if (op.replace_symbol) {
-			errors.push(
-				`operation[${index}].replace_symbol cannot be resolved safely yet; use line anchors or a native ranged edit`,
-			);
-			continue;
-		}
-		errors.push(`operation[${index}] is not a recognized hashline edit`);
-	}
-
-	if (errors.length > 0) {
-		const editBatchSummary = createReadGuardEditBatchSummary({
-			requestedIndexes: boundedIndexesForCount(operations.length),
-			requestedTotal: operations.length,
-			rejectedReasons: boundedIndexesForCount(operations.length).map(
-				(index) => ({
-					index,
-					code: "preflight_blocked" as const,
-				}),
-			),
-			rejectedTotal: operations.length,
-			durationMs: 0,
-			terminalStatus: "blocked",
-		});
-		if (filePath) {
-			logReadGuardEvent({
-				event: "edit_preflight_blocked",
-				correlationId,
-				sessionId,
-				filePath,
-				metadata: {
-					tool: "edit",
-					source: "hashline_edit",
-					reasonKind: "unsupported_hashline_edit_target",
-					operationCount: operations.length,
-					errorCount: errors.length,
-					errors: errors.slice(0, 10),
-				},
-			});
-			logReadGuardEvent({
-				event: "edit_batch_summary",
-				correlationId,
-				filePath,
-				metadata: { tool: "edit", editBatchSummary },
-			});
-		}
-		// Every blocking verdict ends with a single concrete next-action line so
-		// the agent recovers in one turn (#328 — uniform recovery-hint discipline).
-		const target = filePath ? `\`${filePath}\`` : "the file";
-		const retryHint = `Re-read ${target} to get current #line anchors, then retry using set_line / replace_lines with those anchors — or use a native ranged edit.`;
-		return {
-			touchedLines: undefined,
-			preflightError: `🔴 BLOCKED — Unsupported hashline edit target\n\n${errors.join("\n")}\n\n${retryHint}`,
-			editBatchSummary,
-		};
-	}
-	if (ranges.length === 0) return undefined;
-	const result = combineRanges(ranges);
-	if (filePath) {
-		logReadGuardEvent({
-			event: "touched_lines_detected",
-			correlationId,
-			sessionId,
-			filePath,
-			metadata: {
-				tool: "edit",
-				source:
-					ranges.length === 1 && ranges[0][0] === ranges[0][1]
-						? "hashline_set_line"
-						: "hashline_replace_lines",
-				touchedLines: result.touchedLines,
-				editRanges: result.editRanges,
-				operationCount: operations.length,
-			},
-		});
-	}
-	return result;
+/** ✅ note appended to preflight/composed messages for recognized retries. */
+export function formatAlreadyAppliedNotes(
+	editIndexes: number[] | undefined,
+): string {
+	if (!editIndexes || editIndexes.length === 0) return "";
+	const list = boundedEditIndexes(editIndexes)
+		.map((index) => `edits[${index}]`)
+		.join(", ");
+	const suffix = editIndexes.length === 1 ? "was" : "were";
+	const pronoun = editIndexes.length === 1 ? "it" : "them";
+	return `\n\n✅ ${list} ${suffix} already applied by an identical earlier edit — the file already contains the result. Do NOT resubmit ${pronoun}.`;
 }
 
 function findOccurrenceLines(content: string, needle: string): number[] {
@@ -396,18 +325,69 @@ function countRawOccurrences(content: string, needle: string): number {
 
 function exactOldTextForApply(
 	rawContentLf: string,
+	normalizedContent: string,
 	oldText: string,
 	candidate: string,
-): string | undefined {
+): { text: string; start: number; end: number } | undefined {
 	const oldTextLf = oldText.replace(/\r\n/g, "\n");
-	if (countRawOccurrences(rawContentLf, oldTextLf) === 1) return oldTextLf;
+	if (countRawOccurrences(rawContentLf, oldTextLf) === 1) {
+		const start = rawContentLf.indexOf(oldTextLf);
+		return { text: oldTextLf, start, end: start + oldTextLf.length };
+	}
 	if (
 		candidate !== oldTextLf &&
 		countRawOccurrences(rawContentLf, candidate) === 1
 	) {
-		return candidate;
+		const start = rawContentLf.indexOf(candidate);
+		return { text: candidate, start, end: start + candidate.length };
 	}
-	return undefined;
+	if (candidate !== oldTextLf) return undefined;
+	const matchStart = normalizedContent.indexOf(candidate);
+	if (matchStart < 0) return undefined;
+	const rawLines = rawContentLf.split("\n");
+	const normalizedLines = normalizedContent.split("\n");
+	const rawLineStarts: number[] = [];
+	let rawOffset = 0;
+	for (const line of rawLines) {
+		rawLineStarts.push(rawOffset);
+		rawOffset += line.length + 1;
+	}
+	const normalizedLineStarts: number[] = [];
+	let normalizedOffset = 0;
+	for (const line of normalizedLines) {
+		normalizedLineStarts.push(normalizedOffset);
+		normalizedOffset += line.length + 1;
+	}
+	const mapOffset = (offset: number, preferEnd: boolean): number => {
+		const line = Math.min(
+			normalizedLines.length - 1,
+			normalizedContent.slice(0, offset).split("\n").length - 1,
+		);
+		const rawLine = rawLines[line] ?? "";
+		const bomOffset = line === 0 && rawLine.startsWith("\uFEFF") ? 1 : 0;
+		const rawMatchLine = rawLine.slice(bomOffset);
+		const target = offset - normalizedLineStarts[line];
+		const normalizedLine = normalizedLines[line] ?? "";
+		if (target >= normalizedLine.length) {
+			if (preferEnd) return rawLineStarts[line] + rawLine.length;
+			return rawLineStarts[line] + bomOffset + rawMatchLine.length;
+		}
+		let lower = 0;
+		let upper = rawMatchLine.length;
+		for (let boundary = 0; boundary <= rawMatchLine.length; boundary += 1) {
+			const length = normalizeContent(rawMatchLine.slice(0, boundary)).length;
+			if (length === target) return rawLineStarts[line] + bomOffset + boundary;
+			if (length < target) lower = boundary;
+			else if (upper === rawMatchLine.length) upper = boundary;
+		}
+		return rawLineStarts[line] + bomOffset + (preferEnd ? upper : lower);
+	};
+	const start = mapOffset(matchStart, false);
+	const end = mapOffset(matchStart + candidate.length, true);
+	const text = rawContentLf.slice(start, end);
+	return normalizeContent(text) === candidate
+		? { text, start, end }
+		: undefined;
 }
 
 function resolveOldTextEdits(
@@ -415,15 +395,16 @@ function resolveOldTextEdits(
 	filePath: string,
 	sessionId: string | undefined,
 	correlationId?: string,
+	partialApplyRecords?: PartialApplyRecordStore,
 ): GuardLineResult {
 	const startedAt = Date.now();
 	const requestedIndexes: number[] = [];
 	const logBatchEvent = (
 		entry: Parameters<typeof logReadGuardEvent>[0],
 	): void => logReadGuardEvent({ ...entry, correlationId });
-	let rawContent: string;
+	let rawBytes: Buffer;
 	try {
-		rawContent = nodeFs.readFileSync(filePath, "utf-8");
+		rawBytes = nodeFs.readFileSync(filePath);
 	} catch {
 		const editBatchSummary = createReadGuardEditBatchSummary({
 			requestedIndexes: edits.map((edit, index) => edit.originalIndex ?? index),
@@ -449,9 +430,17 @@ function resolveOldTextEdits(
 		});
 		return { touchedLines: undefined, editBatchSummary };
 	}
+	const rawContent = rawBytes.toString("utf8");
 
-	const rawContentLf = rawContent.replace(/\r\n/g, "\n");
+	const rawContentLf = normalizeToLF(rawContent);
 	const content = normalizeContent(rawContent);
+	// #1053: the identity the spans below are resolved against. The apply step
+	// re-reads the file and rejects the whole batch when this no longer holds,
+	// so spans are never re-interpreted against changed bytes. The hash covers
+	// byte identity; spans carry their own bounds checks.
+	const snapshot: EditSnapshotIdentity = {
+		hash: createHash("sha256").update(rawBytes).digest("hex"),
+	};
 	const errors: string[] = [];
 	const failureKinds: string[] = [];
 	const failedEditIndexes: number[] = [];
@@ -459,11 +448,10 @@ function resolveOldTextEdits(
 	const rejectedReasons: EditBatchRejection[] = [];
 	const resolvedIndexes: number[] = [];
 	const resolvedRanges: [number, number][] = [];
-	const passedEdits: Array<{
-		oldText: string;
-		newText: string | undefined;
-		originalIndex: number;
-	}> = [];
+	const candidateEdits: PartiallyApplicableEdit[] = [];
+	const passedEdits: PartiallyApplicableEdit[] = [];
+	let overlapRejectedCount = 0;
+	const alreadyAppliedEdits: number[] = [];
 	let maxFailCount = 0;
 
 	for (let i = 0; i < edits.length; i++) {
@@ -471,6 +459,45 @@ function resolveOldTextEdits(
 		const editIndex = edits[i].originalIndex ?? i;
 		if (requestedIndexes.length < 100) requestedIndexes.push(editIndex);
 		if (!oldText) continue;
+
+		// Exact-retry recognition (#2402): an identical (oldText, newText) pair
+		// this session already applied is recognized from the applied record and
+		// confirmed by content evidence — never resolved again, never re-applied,
+		// never counted as a failure. This is deliberately NOT a global
+		// newText-present heuristic: the record only exists for pairs this
+		// process actually committed.
+		if (partialApplyRecords) {
+			const record = partialApplyRecords.find(
+				filePath,
+				oldText,
+				edits[i].newText,
+			);
+			if (
+				record &&
+				isExactAppliedRetry({
+					contentLf: rawContentLf,
+					oldKey: normalizeContent(oldText),
+					newKey: normalizeContent(edits[i].newText ?? ""),
+					contentHash: snapshot.hash,
+					expectedContentHash: record.contentHash,
+					expectedAfterWriteHash: record.afterWriteContentHash,
+				})
+			) {
+				if (alreadyAppliedEdits.length < 100)
+					alreadyAppliedEdits.push(editIndex);
+				logBatchEvent({
+					event: "edit_already_applied_retry",
+					sessionId,
+					filePath,
+					metadata: {
+						tool: "edit",
+						source: "edits_without_ranges",
+						editIndex,
+					},
+				});
+				continue;
+			}
+		}
 
 		let needle = normalizeContent(oldText);
 		let occurrenceLines = findOccurrenceLines(content, needle);
@@ -603,27 +630,64 @@ function resolveOldTextEdits(
 		} else if (occurrenceLines.length === 1) {
 			const startLine = occurrenceLines[0];
 			const endLine = startLine + needle.split("\n").length - 1;
-			resolvedRanges.push([startLine, endLine]);
-			if (resolvedIndexes.length < 100) resolvedIndexes.push(editIndex);
-			const applyOldText = exactOldTextForApply(rawContentLf, oldText, needle);
-			if (applyOldText !== undefined) {
-				passedEdits.push({
-					oldText: applyOldText,
+			const applySpan = exactOldTextForApply(
+				rawContentLf,
+				content,
+				oldText,
+				needle,
+			);
+			if (applySpan !== undefined) {
+				// #1053: carry the exact span the preflight approved, plus the
+				// snapshot identity it was resolved against. The apply step
+				// consumes these instead of re-searching oldText.
+				candidateEdits.push({
+					oldText,
+					appliedSpanText: applySpan.text,
 					newText: edits[i].newText,
 					originalIndex: editIndex,
+					snapshot,
+					spanStart: applySpan.start,
+					spanEnd: applySpan.end,
+				});
+				resolvedRanges.push([startLine, endLine]);
+				if (resolvedIndexes.length < 100) resolvedIndexes.push(editIndex);
+			} else {
+				failureKinds.push("oldtext_unrepresentable");
+				if (failedEditIndexes.length < 100) failedEditIndexes.push(editIndex);
+				if (rejectedReasons.length < 100) {
+					rejectedReasons.push({
+						index: editIndex,
+						code: "oldtext_unrepresentable",
+					});
+				}
+				errors.push(
+					`edits[${editIndex}].oldText matched normalized content but could not be mapped to one raw file span; the whole batch must be rebuilt from the current file content.`,
+				);
+				logBatchEvent({
+					event: "edit_preflight_blocked",
+					sessionId,
+					filePath,
+					metadata: {
+						tool: "edit",
+						source: "edits_without_ranges",
+						reasonKind: "oldtext_unrepresentable",
+						editIndex,
+					},
 				});
 			}
-			logBatchEvent({
-				event: "oldtext_resolved",
-				sessionId,
-				filePath,
-				metadata: {
-					tool: "edit",
-					source: "edits_without_ranges",
-					editIndex,
-					touchedLines: [startLine, endLine],
-				},
-			});
+			if (applySpan !== undefined) {
+				logBatchEvent({
+					event: "oldtext_resolved",
+					sessionId,
+					filePath,
+					metadata: {
+						tool: "edit",
+						source: "edits_without_ranges",
+						editIndex,
+						touchedLines: [startLine, endLine],
+					},
+				});
+			}
 		} else {
 			const preview = oldText.trimStart().substring(0, 60).replace(/\n/g, "↵");
 			failureKinds.push("oldtext_duplicate");
@@ -659,14 +723,95 @@ function resolveOldTextEdits(
 		}
 	}
 
+	// Overlap guard (#1053): individually-unique matches can still overlap
+	// (e.g. "abc" and "bcd" both matching inside "xabcy"). Applying both would
+	// splice corrupt content, so overlapping candidates are rejected together
+	// with one explicit message instead of being silently skipped.
+	const sortedCandidates = [...candidateEdits].sort(
+		(a, b) => a.spanStart - b.spanStart,
+	);
+	const overlaps = overlapPairs(sortedCandidates);
+	for (let i = 0; i < sortedCandidates.length; i += 1) {
+		const candidate = sortedCandidates[i];
+		const overlapping = sortedCandidates.find(
+			(other) =>
+				other !== candidate &&
+				other.spanStart < candidate.spanEnd &&
+				candidate.spanStart < other.spanEnd,
+		);
+		if (overlapping) {
+			overlapRejectedCount += 1;
+			if (rejectedReasons.length < 100) {
+				rejectedReasons.push({
+					index: candidate.originalIndex,
+					code: "span_overlap",
+				});
+			}
+			continue;
+		}
+		passedEdits.push(candidate);
+	}
+	for (const [a, b] of overlaps) {
+		errors.push(
+			`edits[${a.originalIndex}] and edits[${b.originalIndex}] resolved to overlapping spans of the file — their oldTexts match regions that share bytes. Extend one oldText with a unique neighboring line so each edit targets one unambiguous span, or apply them in separate calls.`,
+		);
+	}
+	// Overlap is a batch-level safety failure. Do not partially commit an
+	// unrelated candidate from the same request while another pair is
+	// ambiguous; the apply seam promises all-or-nothing preflight rejection.
+	if (overlaps.length > 0) passedEdits.length = 0;
+
 	const oldTextEditCount = edits.filter((edit) => !!edit.oldText).length;
-	if (errors.length > 0 || resolvedRanges.length !== oldTextEditCount) {
+
+	// Pure already-applied batch (#2402): every oldText edit is a recognized
+	// exact retry, nothing failed, nothing remains to apply. The verdict is the
+	// idempotent "already applied" note, never an escalating error.
+	if (
+		errors.length === 0 &&
+		passedEdits.length === 0 &&
+		alreadyAppliedEdits.length > 0 &&
+		alreadyAppliedEdits.length === oldTextEditCount
+	) {
+		const header = `✅ ALREADY APPLIED — every edit in this call was already applied by an identical earlier submission. Do NOT retry this payload; re-read the file if you need to build a new edit.`;
+		const details = alreadyAppliedEdits.map(
+			(editIndex) => `edits[${editIndex}]: already applied — do not resubmit.`,
+		);
+		const editBatchSummary = createReadGuardEditBatchSummary({
+			requestedIndexes,
+			requestedTotal: edits.length,
+			alreadyAppliedIndexes: boundedEditIndexes(alreadyAppliedEdits),
+			alreadyAppliedTotal: alreadyAppliedEdits.length,
+			durationMs: Date.now() - startedAt,
+			terminalStatus: "skipped",
+		});
+		logBatchEvent({
+			event: "edit_batch_summary",
+			correlationId,
+			filePath,
+			metadata: { tool: "edit", editBatchSummary },
+		});
+		return {
+			touchedLines: undefined,
+			preflightError: `${header}\n\n${details.join("\n")}`,
+			preflightHeader: header,
+			preflightDetails: details,
+			alreadyAppliedEdits,
+			editBatchSummary,
+		};
+	}
+
+	if (
+		errors.length > 0 ||
+		alreadyAppliedEdits.length > 0 ||
+		resolvedRanges.length !== oldTextEditCount
+	) {
 		const failureDetails =
 			errors.length > 0
 				? errors
-				: [
-						"One or more edit targets could not be resolved to exact lines. Re-read the relevant section and retry with the exact content as it appears in the file.",
-					];
+				: alreadyAppliedEdits.map(
+						(editIndex) =>
+							`edits[${editIndex}]: already applied — do not resubmit.`,
+					);
 		const uniqueFailureKinds = [...new Set(failureKinds)];
 		const editBatchSummary = createReadGuardEditBatchSummary({
 			requestedIndexes,
@@ -674,7 +819,15 @@ function resolveOldTextEdits(
 			resolvedIndexes,
 			resolvedTotal: resolvedRanges.length,
 			rejectedReasons,
-			rejectedTotal: Math.max(0, oldTextEditCount - resolvedRanges.length),
+			rejectedTotal: Math.max(
+				0,
+				oldTextEditCount -
+					resolvedRanges.length -
+					alreadyAppliedEdits.length +
+					overlapRejectedCount,
+			),
+			alreadyAppliedIndexes: boundedEditIndexes(alreadyAppliedEdits),
+			alreadyAppliedTotal: alreadyAppliedEdits.length,
 			durationMs: Date.now() - startedAt,
 			terminalStatus: "blocked",
 		});
@@ -695,19 +848,22 @@ function resolveOldTextEdits(
 				oldTextEditCount,
 				resolvedOldTextEditCount: resolvedRanges.length,
 				unresolvedOldTextEditCount: oldTextEditCount - resolvedRanges.length,
+				alreadyAppliedCount: alreadyAppliedEdits.length,
+				overlapRejectedCount,
 				failedEditIndexes,
 				oldTextPreviews: failedOldTextPreviews.slice(0, 5),
 				errorCount: errors.length,
 			},
 		});
-		const appliedNote =
-			passedEdits.length > 0
-				? `\n\n${passedEdits.map((e) => `edits[${e.originalIndex}]`).join(", ")} ${passedEdits.length === 1 ? "was" : "were"} applied — do NOT re-submit ${passedEdits.length === 1 ? "it" : "them"}.`
-				: "";
 		const header =
-			maxFailCount >= 2
-				? `🛑 RE-READ REQUIRED — You have submitted this oldText before and it still does not match.\n\nDo NOT retry from memory. Re-read \`${filePath}\` to get the current content, then rebuild your edit from the verbatim file text.`
-				: `🔄 RETRYABLE — Edit target not found`;
+			errors.length === 0
+				? `✅ ALREADY APPLIED — some edits in this call were already applied by an identical earlier submission. Do NOT resubmit them.`
+				: maxFailCount >= 2
+					? `🛑 RE-READ REQUIRED — You have submitted this oldText before and it still does not match.\n\nDo NOT retry from memory. Re-read \`${filePath}\` to get the current content, then rebuild your edit from the verbatim file text.`
+					: uniqueFailureKinds.length === 1 &&
+						  uniqueFailureKinds[0] === "span_overlap"
+						? `🔄 RETRYABLE — Overlapping edit spans`
+						: `🔄 RETRYABLE — Edit target not found`;
 		logBatchEvent({
 			event: "edit_batch_summary",
 			correlationId,
@@ -716,8 +872,16 @@ function resolveOldTextEdits(
 		});
 		return {
 			touchedLines: undefined,
-			preflightError: `${header}\n\n${failureDetails.join("\n\n")}${appliedNote}`,
-			partiallyApplicable: passedEdits.length > 0 ? passedEdits : undefined,
+			preflightError: `${header}\n\n${failureDetails.join("\n\n")}${formatAlreadyAppliedNotes(alreadyAppliedEdits)}`,
+			preflightHeader: header,
+			preflightDetails: failureDetails,
+			partiallyApplicable:
+				passedEdits.length > 0 &&
+				!failureKinds.includes("oldtext_unrepresentable")
+					? passedEdits
+					: undefined,
+			alreadyAppliedEdits:
+				alreadyAppliedEdits.length > 0 ? alreadyAppliedEdits : undefined,
 			editBatchSummary,
 		};
 	}
@@ -782,20 +946,16 @@ function resolveOldTextEdits(
 	};
 }
 
+// Canonical applied-edit keying lives beside the partial-apply seam that both
+// writes and consumes it (partial-edit-apply.ts, #1053/#2402).
+export { stripOldTextTrailingWhitespace } from "./partial-edit-apply.js";
+
 /**
  * Normalises an oldText string for whitespace-only differences that editors routinely
  * introduce: trailing spaces/tabs on each line are stripped, and any trailing blank
  * lines (lines that are empty after trimming) are removed from the end. CRLF is
  * normalised to LF. Returns the same string if no change was needed.
  */
-export function stripOldTextTrailingWhitespace(value: string): string {
-	const lines = value
-		.replace(/\r\n/g, "\n")
-		.split("\n")
-		.map((l) => l.trimEnd());
-	while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
-	return lines.join("\n");
-}
 
 /**
  * Tries to fix a tab/space indentation mismatch between the model's oldText and the
@@ -1206,8 +1366,33 @@ export function getTouchedLinesForGuard(
 	filePath?: string,
 	sessionId?: string,
 	correlationId?: string,
+	partialApplyRecords?: PartialApplyRecordStore,
 ): GuardLineResult {
-	if (isToolCallEventType("edit", event as any)) {
+	// #2423: the seam decides whether this event mutates a file, and which shape
+	// adapter (if any) already resolved its ranges. A tool named `replace` or
+	// `insert` reaches the native-shape ladder below exactly like `edit` does.
+	const mutation = classifyMutatingTool(event, {
+		filePath,
+		sessionId,
+		correlationId,
+	});
+	if (mutation === undefined) return { touchedLines: undefined };
+
+	if (mutation.kind === "edit") {
+		// An adapter that recognized the input owns the answer, including a
+		// blocking preflight error.
+		if (mutation.touchedLines !== undefined || mutation.preflightError) {
+			return {
+				touchedLines: mutation.touchedLines,
+				...(mutation.editRanges ? { editRanges: mutation.editRanges } : {}),
+				...(mutation.preflightError
+					? { preflightError: mutation.preflightError }
+					: {}),
+				...(mutation.editBatchSummary
+					? { editBatchSummary: mutation.editBatchSummary }
+					: {}),
+			};
+		}
 		// The host standard-edit fields (path, edits[].oldText/newText) are pinned
 		// to the SDK's EditToolInput, so a host edit-schema change is a compile
 		// error instead of silently falling through to `unknown_edit_schema`. The
@@ -1229,13 +1414,6 @@ export function getTouchedLinesForGuard(
 			replace_lines?: unknown;
 			replace_symbol?: unknown;
 		};
-		const hashlineResult = resolveHashlineEditInput(
-			editInput as Record<string, unknown>,
-			filePath,
-			sessionId,
-			correlationId,
-		);
-		if (hashlineResult) return hashlineResult;
 		if (editInput.oldRange) {
 			const touchedLines: [number, number] = [
 				editInput.oldRange.start.line,
@@ -1280,6 +1458,7 @@ export function getTouchedLinesForGuard(
 						filePath,
 						sessionId,
 						correlationId,
+						partialApplyRecords,
 					);
 				}
 				return { touchedLines: undefined };
@@ -1292,9 +1471,18 @@ export function getTouchedLinesForGuard(
 					filePath,
 					sessionId,
 					correlationId,
+					partialApplyRecords,
 				);
 				if (resolved.preflightError) {
-					return resolved;
+					// A mixed range/oldText request is one host operation. If any
+					// oldText edit cannot be represented as a carried raw span,
+					// close the whole batch instead of letting the host apply only
+					// the native ranges.
+					return {
+						...resolved,
+						partiallyApplicable: undefined,
+						touchedLines: undefined,
+					};
 				}
 				oldTextTouchedLines = resolved.touchedLines;
 				oldTextEditRanges = resolved.editRanges;
@@ -1347,6 +1535,18 @@ export function getTouchedLinesForGuard(
 				metadata: {
 					tool: "edit",
 					source: "unknown_edit_schema",
+					// #2423: name the tool. An unknown schema under a third-party
+					// tool name is the actionable case — it says which producer
+					// needs a shape adapter.
+					mutatingToolName: mutation.toolName,
+					mutationProvenance: mutation.provenance,
+					// #2423 review round 1 (F1): an adapter that RECOGNIZED the
+					// shape but could not turn its anchors into lines says so here.
+					// `adapterSource: "hashline-edit-pro"` with
+					// `unresolvedReason: "remove_from:anchor_not_found"` is the
+					// production record of a stale anchor — a report, not a block.
+					adapterSource: mutation.source,
+					unresolvedReason: mutation.unresolvedReason,
 					topLevelKeys,
 					hasNativeOldRange: !!editInput.oldRange,
 					hasNativeEdits: Array.isArray(editInput.edits),
@@ -1362,25 +1562,22 @@ export function getTouchedLinesForGuard(
 		return { touchedLines: undefined };
 	}
 
-	if (isToolCallEventType("write", event as any)) {
-		const lineCount = filePath ? countFileLines(filePath) : 1;
-		const touchedLines: [number, number] = [1, lineCount];
-		if (filePath) {
-			logReadGuardEvent({
-				event: "touched_lines_detected",
-				correlationId,
-				sessionId,
-				filePath,
-				metadata: {
-					tool: "write",
-					source: "full_file_write",
-					touchedLines,
-					lineCount,
-				},
-			});
-		}
-		return { touchedLines };
+	// kind === "write": the whole file is the touched range.
+	const lineCount = filePath ? countFileLines(filePath) : 1;
+	const writeTouchedLines: [number, number] = [1, lineCount];
+	if (filePath) {
+		logReadGuardEvent({
+			event: "touched_lines_detected",
+			correlationId,
+			sessionId,
+			filePath,
+			metadata: {
+				tool: "write",
+				source: "full_file_write",
+				touchedLines: writeTouchedLines,
+				lineCount,
+			},
+		});
 	}
-
-	return { touchedLines: undefined };
+	return { touchedLines: writeTouchedLines };
 }

@@ -6,7 +6,7 @@
 
 import { relative, resolve, sep, posix } from "node:path";
 
-import { GoClient } from "../../go-client.js";
+import { goClient } from "../../go-client.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { stripAnsi } from "../../sanitize.js";
 import { skipUnlessToolRan } from "./utils/tool-failure.js";
@@ -18,13 +18,10 @@ import type {
 } from "../types.js";
 import { PRIORITY } from "../priorities.js";
 
-const goClient = new GoClient();
-
 const goVetRunner: RunnerDefinition = {
 	id: "go-vet",
 	appliesTo: ["go"],
 	priority: PRIORITY.SPECIALIZED_ANALYSIS,
-	enabledByDefault: true,
 	timeoutMs: 40_000,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

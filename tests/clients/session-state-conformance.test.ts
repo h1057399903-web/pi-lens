@@ -30,10 +30,13 @@ import {
 } from "../support/session-state-registry.js";
 import {
 	SWEEP_HEURISTIC_LIMITS,
+	auditContainerClassExclusions,
 	callsWithinFunction,
+	callsWithinSessionStartClosure,
 	clientSourceFiles,
 	resetNameDefinitions,
 	scanSessionStateCandidates,
+	sessionStartClosureResetNames,
 	sessionStartResetNames,
 	stripCommentsAndStrings,
 } from "../support/session-state-scan.js";
@@ -216,8 +219,94 @@ describe("session-state scan — walker smuggle probes (R1/S1)", () => {
 	});
 });
 
+// The closure walker's own correctness, pinned against synthetic source the
+// same way the handleSessionStart walker is above (#2319). A reset named only
+// in a comment inside the closure, or a brace smuggled through a string, must
+// not read as a call — the closure-site registry entries depend on it.
+describe("session-state scan — closure walker smuggle probes (#2319)", () => {
+	const closureSource = (body: string[]) =>
+		[
+			"pi.on(",
+			'\t"session_start",',
+			'\twrapSessionEventHandler("session_start", async (event, ctx) => {',
+			...body,
+			"\t});",
+			");",
+		].join("\n");
+
+	it("a reset named only in a comment in the closure does not count as called", () => {
+		const source = closureSource([
+			"\t\t// resetConcurrentSessionBindRollupCounts(); — #2319 says this belongs here",
+			"\t\tresetVerifiedPathAttributionGuessCount();",
+		]);
+		const calls = callsWithinSessionStartClosure(source);
+		expect(calls).toContain("resetVerifiedPathAttributionGuessCount");
+		expect(calls).not.toContain("resetConcurrentSessionBindRollupCounts");
+	});
+
+	it("a brace inside a string in the closure cannot end the body early", () => {
+		const source = closureSource([
+			'\t\tconst s = "a } here";',
+			"\t\tresetVerifiedPathAttributionGuessCount();",
+		]);
+		expect(callsWithinSessionStartClosure(source)).toContain(
+			"resetVerifiedPathAttributionGuessCount",
+		);
+	});
+
+	it("the real call is still found when both forms are present", () => {
+		const source = closureSource([
+			"\t\t// resetVerifiedPathAttributionGuessCount() — see #2319",
+			"\t\tresetConcurrentSessionBindRollupCounts();",
+		]);
+		const calls = callsWithinSessionStartClosure(source);
+		expect(calls).toContain("resetConcurrentSessionBindRollupCounts");
+		expect(calls).not.toContain("resetVerifiedPathAttributionGuessCount");
+	});
+
+	it("a reset deferred to a callback does not count as a direct call", () => {
+		const source = closureSource([
+			"\t\tsetImmediate(() => resetVerifiedPathAttributionGuessCount());",
+			"\t\tPromise.resolve().then(() => {",
+			"\t\t\tresetConcurrentSessionBindRollupCounts();",
+			"\t\t});",
+		]);
+		expect(callsWithinSessionStartClosure(source)).not.toContain(
+			"resetVerifiedPathAttributionGuessCount",
+		);
+		expect(callsWithinSessionStartClosure(source)).not.toContain(
+			"resetConcurrentSessionBindRollupCounts",
+		);
+	});
+
+	it("a reset deferred to a function callback does not count as direct", () => {
+		const source = closureSource([
+			"\t\tsetImmediate(function () {",
+			"\t\t\tresetVerifiedPathAttributionGuessCount();",
+			"\t\t});",
+		]);
+		expect(callsWithinSessionStartClosure(source)).not.toContain(
+			"resetVerifiedPathAttributionGuessCount",
+		);
+	});
+
+	it("returns empty when the registration shape changes — the failure is loud, not silent", () => {
+		// #2319: if the wrapper/event registration is renamed or reformatted,
+		// the derivation yields nothing and every closure-site registry entry
+		// goes red through its wiring test. It must never report a phantom set.
+		const source = [
+			"pi.on(",
+			'\t"session_start",',
+			"\thonSessionStart(doTheThing);",
+			");",
+		].join("\n");
+		expect(callsWithinSessionStartClosure(source)).toEqual([]);
+	});
+});
+
 describe("session-state registry — session_start wiring", () => {
 	const wired = sessionStartResetNames();
+	const closureWired = sessionStartClosureResetNames();
 
 	it("derives a non-trivial reset chain from handleSessionStart", () => {
 		// A silent derivation failure (renamed entry point, broken brace match)
@@ -227,14 +316,39 @@ describe("session-state registry — session_start wiring", () => {
 		expect(wired.has("resetDegradationLedger")).toBe(true);
 	});
 
+	it("derives the session_start closure resets from index.ts (#2319)", () => {
+		// The closure-site entries below depend on THIS derivation, so a silent
+		// failure (renamed wrapper, moved registration) would make their wiring
+		// claims vacuous — the same guard the floor above gives `wired`. The
+		// exact members can shift with legitimate edits; the three registered
+		// ones cannot, or their entries red here.
+		expect(closureWired.size).toBeGreaterThanOrEqual(5);
+		for (const name of [
+			"resetVerifiedPathAttributionGuessCount",
+			"resetCurrentPhaseForSession",
+			"resetConcurrentSessionBindRollupCounts",
+		]) {
+			expect(closureWired.has(name)).toBe(true);
+		}
+	});
+
 	for (const entry of SESSION_STATE_REGISTRY) {
 		if (entry.policy !== "session_start" || entry.gap) continue;
 		const sessionStartName = entry.sessionStartResetName ?? entry.resetName;
 		it(`${entry.id}: ${sessionStartName} runs at session_start`, () => {
+			// #2319: entries whose reset deliberately lives in index.ts's
+			// session_start CLOSURE (not handleSessionStart's reachable graph)
+			// are checked against the closure derivation. Every other entry
+			// keeps the handleSessionStart walk, unchanged.
+			const reached = entry.sessionStartClosureReset ? closureWired : wired;
+			const site = entry.sessionStartClosureReset
+				? "index.ts's session_start closure"
+				: "handleSessionStart";
 			expect(
-				wired.has(sessionStartName),
-				`${sessionStartName} is not reachable from handleSessionStart. ` +
-					"Either wire it in, or change the entry's policy and say why.",
+				reached.has(sessionStartName),
+				`${sessionStartName} is not reachable from ${site}. ` +
+					"Either wire it in, change the entry's policy and say why, or drop " +
+					"the sessionStartClosureReset marker.",
 			).toBe(true);
 		});
 	}
@@ -502,6 +616,538 @@ describe("session-state sweep — symbol-count pin regression (#1817)", () => {
 					pinned: { "already-registered.ts": 2 },
 				});
 				expect(pinAudit.problems.length).toBeGreaterThan(0);
+			},
+		);
+	});
+});
+
+describe("session-state scan — repo container classes are containers (#2442 F2, #2455)", () => {
+	function withFixtureTree(
+		files: Record<string, string>,
+		run: (dir: string) => void,
+	): void {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-session-state-bounded-"),
+		);
+		try {
+			for (const [name, contents] of Object.entries(files)) {
+				fs.writeFileSync(path.join(dir, name), contents);
+			}
+			run(dir);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	// The class definitions the fixture modules below import. #2455 replaced
+	// the hard-coded `Map|Set|WeakMap|WeakSet|PathKeyedMap|BoundedFifoMap|
+	// BoundedLruCache` alternation with a live scan of exported classes that
+	// own a `clear()`/`delete()` method, so the fixture tree must carry the
+	// class DEFINITIONS the detector is meant to discover — a name alone (as
+	// the pre-#2455 fixture used, importing from a `bounded-cache.js` that
+	// never existed in the fixture tree) no longer proves anything about the
+	// new mechanism.
+	const CONTAINER_CLASSES_MODULE = [
+		"export class BoundedFifoMap<K, V> {",
+		"\tprivate readonly entries = new Map<K, V>();",
+		"\tconstructor(maxEntries: number) {}",
+		"\tclear(): void {",
+		"\t\tthis.entries.clear();",
+		"\t}",
+		"\tdelete(key: K): boolean {",
+		"\t\treturn this.entries.delete(key);",
+		"\t}",
+		"}",
+		"",
+		// Owns neither method directly — recognised only through the `extends`
+		// chain, exactly like the real `BoundedLruCache` (bounded-cache.ts).
+		"export class BoundedLruCache<K, V> extends BoundedFifoMap<K, V> {",
+		"\toverride get(key: K): V | undefined {",
+		"\t\treturn undefined;",
+		"\t}",
+		"}",
+		"",
+	].join("\n");
+
+	// #2442 migrated ~20 module-level `new Map()` caches to BoundedFifoMap /
+	// BoundedLruCache. The (then hard-coded) container regex named only
+	// Map/Set/WeakMap/WeakSet/PathKeyedMap, so every migrated module silently
+	// DROPPED OUT of this sweep — cache-observability.ts went from two
+	// recognised containers to zero and no test noticed. A refactor from a raw
+	// Map to one of this repo's own container wrappers must never make session
+	// state invisible.
+	//
+	// MUTATION: replace `containerClassNames`'s live scan with the old
+	// hard-coded alternation (`Map|Set|WeakMap|WeakSet|PathKeyedMap|
+	// BoundedFifoMap|BoundedLruCache`) in tests/support/session-state-scan.ts
+	// and this test still passes for THESE two names (they were in the old
+	// list) — the point of this fixture is `BoundedLruCache`'s `extends`
+	// chain, which the old flat regex never had to resolve. The `#2455`
+	// describe block below is what actually reds under that mutation, because
+	// it uses a name the hard-coded list never knew.
+	const BOUNDED_MODULE = [
+		'import { BoundedFifoMap, BoundedLruCache } from "./container-classes.js";',
+		"",
+		"const fifoLatch = new BoundedFifoMap<string, number>(8);",
+		"const lruLatch = new BoundedLruCache<string, number>(8);",
+		"",
+		"export function resetBoundedLatches(): void {",
+		"\tfifoLatch.clear();",
+		"\tlruLatch.clear();",
+		"}",
+		"",
+	].join("\n");
+
+	it("flags a module-level `new BoundedFifoMap()` / `new BoundedLruCache()`", () => {
+		withFixtureTree(
+			{
+				"bounded-holder.ts": BOUNDED_MODULE,
+				"container-classes.ts": CONTAINER_CLASSES_MODULE,
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const holder = candidates.find((c) => c.file === "bounded-holder.ts");
+				expect(holder?.containers).toEqual(["fifoLatch", "lruLatch"]);
+			},
+		);
+	});
+
+	it("counts them for the symbol-count pin, so a new bounded latch reds", () => {
+		withFixtureTree(
+			{
+				"bounded-holder.ts": BOUNDED_MODULE,
+				"container-classes.ts": CONTAINER_CLASSES_MODULE,
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const counts: Record<string, number> = {};
+				for (const c of candidates) counts[c.file] = c.containers.length;
+				// A pin captured when the file held only the FIFO latch.
+				const pinAudit = auditSymbolCounts({
+					sweepName: "fixture symbol-count audit",
+					counts,
+					pinned: { "bounded-holder.ts": 1, "container-classes.ts": 0 },
+				});
+				expect(pinAudit.unaccounted).toEqual(["bounded-holder.ts@2"]);
+			},
+		);
+	});
+
+	it("still ignores a bounded container declared inside a function", () => {
+		// Column zero is the module-scope signal; a per-call container is
+		// re-armed by construction and must not be flagged.
+		withFixtureTree(
+			{
+				"container-classes.ts": CONTAINER_CLASSES_MODULE,
+				"per-call.ts": [
+					'import { BoundedFifoMap } from "./container-classes.js";',
+					"",
+					"export function makeCache(): unknown {",
+					"\tconst perCall = new BoundedFifoMap<string, number>(8);",
+					"\treturn perCall;",
+					"}",
+					"",
+					"export function resetNothing(): void {}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const perCall = candidates.find((c) => c.file === "per-call.ts");
+				expect(perCall?.containers ?? []).toEqual([]);
+			},
+		);
+	});
+});
+
+// #2455: the detector must recognise a BRAND NEW repo-local collection class
+// by what it DOES (owns `clear()`/`delete()`), not by whether its name made
+// it into a hand-maintained list. `SomeRepoLocalCollection` below names
+// nothing the pre-#2455 hard-coded alternation
+// (`Map|Set|WeakMap|WeakSet|PathKeyedMap|BoundedFifoMap|BoundedLruCache`)
+// could ever have matched — proof that the detector generalises rather than
+// having simply grown a fourth hard-coded name.
+//
+// MUTATION: revert `tests/support/session-state-scan.ts` to the pre-#2455
+// hard-coded `CONTAINER_DECLARATION` alternation and every test in this
+// block reds — `SomeRepoLocalCollection` is invisible to a fixed name list
+// by construction.
+describe("session-state scan — new repo-local collection classes need no detector edit (#2455)", () => {
+	function withFixtureTree(
+		files: Record<string, string>,
+		run: (dir: string) => void,
+	): void {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-session-state-new-class-"),
+		);
+		try {
+			for (const [name, contents] of Object.entries(files)) {
+				fs.writeFileSync(path.join(dir, name), contents);
+			}
+			run(dir);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	const NEW_CLASS_MODULE = [
+		"export class SomeRepoLocalCollection<K, V> {",
+		"\tprivate readonly entries = new Map<K, V>();",
+		"\tset(key: K, value: V): void {",
+		"\t\tthis.entries.set(key, value);",
+		"\t}",
+		"\tdelete(key: K): boolean {",
+		"\t\treturn this.entries.delete(key);",
+		"\t}",
+		"}",
+		"",
+	].join("\n");
+
+	const HOLDER_MODULE = [
+		'import { SomeRepoLocalCollection } from "./new-collection-class.js";',
+		"",
+		"const sessionLatch = new SomeRepoLocalCollection<string, number>();",
+		"",
+		"export function resetSessionLatch(): void {",
+		'\tsessionLatch.delete("k");',
+		"}",
+		"",
+	].join("\n");
+
+	it("flags a module-level `new SomeRepoLocalCollection()` without editing the detector", () => {
+		withFixtureTree(
+			{
+				"new-collection-class.ts": NEW_CLASS_MODULE,
+				"holder.ts": HOLDER_MODULE,
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const holder = candidates.find((c) => c.file === "holder.ts");
+				expect(holder?.containers).toEqual(["sessionLatch"]);
+			},
+		);
+	});
+
+	it("resolves the container class through an `extends` chain too", () => {
+		const subclassModule = [
+			NEW_CLASS_MODULE,
+			// Owns neither `clear()` nor `delete()` in its own body — only
+			// through the `extends` chain, same shape as `BoundedLruCache`.
+			"export class SomeRepoLocalSubclass<K, V> extends SomeRepoLocalCollection<K, V> {",
+			"\toverride set(key: K, value: V): void {",
+			"\t\tsuper.set(key, value);",
+			"\t}",
+			"}",
+			"",
+		].join("\n");
+		withFixtureTree(
+			{
+				"new-collection-class.ts": subclassModule,
+				"holder.ts": [
+					'import { SomeRepoLocalSubclass } from "./new-collection-class.js";',
+					"",
+					"const sessionLatch = new SomeRepoLocalSubclass<string, number>();",
+					"",
+					"export function resetSessionLatch(): void {",
+					'\tsessionLatch.delete("k");',
+					"}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const holder = candidates.find((c) => c.file === "holder.ts");
+				expect(holder?.containers).toEqual(["sessionLatch"]);
+			},
+		);
+	});
+
+	it("still ignores the new class declared inside a function (module scope still required)", () => {
+		withFixtureTree(
+			{
+				"new-collection-class.ts": NEW_CLASS_MODULE,
+				"per-call.ts": [
+					'import { SomeRepoLocalCollection } from "./new-collection-class.js";',
+					"",
+					"export function makeLatch(): unknown {",
+					"\tconst perCall = new SomeRepoLocalCollection<string, number>();",
+					"\treturn perCall;",
+					"}",
+					"",
+					"export function resetNothing(): void {}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const perCall = candidates.find((c) => c.file === "per-call.ts");
+				expect(perCall?.containers ?? []).toEqual([]);
+			},
+		);
+	});
+});
+
+describe("session-state scan — class-declaration shape matrix (#2455 fix round 2, F2)", () => {
+	function withFixtureTree(
+		files: Record<string, string>,
+		run: (dir: string) => void,
+	): void {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-session-state-shapes-"),
+		);
+		try {
+			for (const [name, contents] of Object.entries(files)) {
+				fs.writeFileSync(path.join(dir, name), contents);
+			}
+			run(dir);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	// Every shape the round-1 `^export class NAME(?:<[^>]*>)?...` regex missed
+	// (the reviewer's MISS list): a non-exported class visible only through a
+	// separate `export { A }` / `export { A as B }` list, `export default
+	// class`, `export abstract class`, `export default abstract class`, and a
+	// nested generic in either the class's own type parameters or its
+	// `extends` target — round 1's `[^>]*` stopped at the first `>`, one short
+	// of the real end, and silently failed to match the whole declaration.
+	const NAMED_CLASSES_MODULE = [
+		"export class ExportedPlain {",
+		"\tclear(): void {}",
+		"}",
+		"",
+		"export abstract class ExportedAbstract {",
+		"\tclear(): void {}",
+		"}",
+		"",
+		// Non-exported, re-exported under its own name.
+		"class BareReexported {",
+		"\tdelete(key: string): boolean {",
+		"\t\treturn true;",
+		"\t}",
+		"}",
+		"export { BareReexported };",
+		"",
+		// Non-exported, re-exported under an ALIAS — the caller elsewhere
+		// constructs `new AliasedName(...)`, never `new BareAliased(...)`.
+		"class BareAliased {",
+		"\tdelete(key: string): boolean {",
+		"\t\treturn true;",
+		"\t}",
+		"}",
+		"export { BareAliased as AliasedName };",
+		"",
+		// Nested generic in the class's OWN type parameter list — round 1's
+		// `(?:<[^>]*>)?` after the name stopped at the `>` inside `Map<K, V>`,
+		// one short of the outer `>>`, and the whole declaration regex failed
+		// to match.
+		"export class NestedOwnGeneric<T extends Map<string, number>> {",
+		"\tclear(): void {}",
+		"}",
+		"",
+		// Nested generic in the `extends` target, same failure mode. The base
+		// class need not exist for THIS class's own name to be captured —
+		// round 2 no longer resolves `extends` at all.
+		"export class NestedExtendsGeneric extends UnknownBase<Map<string, number>> {",
+		"\tclear(): void {}",
+		"}",
+		"",
+	].join("\n");
+
+	const DEFAULT_CLASS_MODULE = [
+		"export default class DefaultNamed {",
+		"\tclear(): void {}",
+		"}",
+		"",
+	].join("\n");
+
+	const DEFAULT_ABSTRACT_CLASS_MODULE = [
+		"export default abstract class DefaultAbstractNamed {",
+		"\tclear(): void {}",
+		"}",
+		"",
+	].join("\n");
+
+	const HOLDER_MODULE = [
+		"import {",
+		"\tExportedPlain,",
+		"\tExportedAbstract,",
+		"\tBareReexported,",
+		"\tAliasedName,",
+		"\tNestedOwnGeneric,",
+		"\tNestedExtendsGeneric,",
+		'} from "./named-classes.js";',
+		'import DefaultNamed from "./default-class.js";',
+		'import DefaultAbstractNamed from "./default-abstract-class.js";',
+		"",
+		"const a = new ExportedPlain();",
+		"const b = new ExportedAbstract();",
+		"const c = new BareReexported();",
+		"const d = new AliasedName();",
+		"const e = new NestedOwnGeneric<string, number>();",
+		"const f = new NestedExtendsGeneric();",
+		"const g = new DefaultNamed();",
+		"const h = new DefaultAbstractNamed();",
+		"",
+		"export function resetShapeHolder(): void {",
+		"\ta.clear();",
+		"\tb.clear();",
+		'\tc.delete("k");',
+		'\td.delete("k");',
+		"\te.clear();",
+		"\tf.clear();",
+		"\tg.clear();",
+		"\th.clear();",
+		"}",
+		"",
+	].join("\n");
+
+	it("flags a module-level `new` for every class-declaration export shape", () => {
+		withFixtureTree(
+			{
+				"named-classes.ts": NAMED_CLASSES_MODULE,
+				"default-class.ts": DEFAULT_CLASS_MODULE,
+				"default-abstract-class.ts": DEFAULT_ABSTRACT_CLASS_MODULE,
+				"holder.ts": HOLDER_MODULE,
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const holder = candidates.find((c) => c.file === "holder.ts");
+				expect(holder?.containers).toEqual([
+					"a",
+					"b",
+					"c",
+					"d",
+					"e",
+					"f",
+					"g",
+					"h",
+				]);
+			},
+		);
+	});
+
+	it("MUTATION: reverting to the round-1 `^export class` regex misses every shape but the first", () => {
+		// Named directly rather than imported, so this test cannot silently stop
+		// covering the mutation if the production regex is ever refactored under
+		// a different name.
+		const round1Regex =
+			/^export class ([A-Za-z_$][\w$]*)(?:<[^>]*>)?(?:\s+extends\s+([A-Za-z_$][\w$]*)(?:<[^>]*>)?)?(?:\s+implements\s+[^{]*)?\s*\{/gm;
+		const found = [...NAMED_CLASSES_MODULE.matchAll(round1Regex)].map(
+			(m) => m[1],
+		);
+		// Round 1 requires the LITERAL text "export class", so even
+		// ExportedAbstract ("export abstract class") fails it; ExportedPlain is
+		// the only shape with no generic and no re-export indirection the old
+		// regex could still reach.
+		expect(found).toEqual(["ExportedPlain"]);
+	});
+});
+
+describe("session-state scan — CONTAINER_CLASS_EXCLUSIONS guards (#2455 fix round 2, F3)", () => {
+	function withFixtureTree(
+		files: Record<string, string>,
+		run: (dir: string) => void,
+	): void {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-session-state-exclusions-"),
+		);
+		try {
+			for (const [name, contents] of Object.entries(files)) {
+				fs.writeFileSync(path.join(dir, name), contents);
+			}
+			run(dir);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	it("the real CONTAINER_CLASS_EXCLUSIONS table has no problems (empty today)", () => {
+		expect(auditContainerClassExclusions()).toEqual([]);
+	});
+
+	it("reds on a stale entry — a class name the live scan does not find", () => {
+		// The reviewer's exact probe: before this guard existed, a nonexistent
+		// class name paired with an empty-string reason changed nothing
+		// observable, because the exclusion deleted a key that was never in the
+		// declared-class Set to begin with — the sweep stayed green.
+		withFixtureTree(
+			{
+				"real-class.ts": [
+					"export class RealClass {",
+					"\tclear(): void {}",
+					"}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const problems = auditContainerClassExclusions(
+					{ NonexistentClass: "a real reason, just naming the wrong class" },
+					dir,
+				);
+				expect(problems).toEqual([
+					'CONTAINER_CLASS_EXCLUSIONS names "NonexistentClass", which the live class scan does not find — stale entry (renamed, deleted, or never existed)',
+				]);
+			},
+		);
+	});
+
+	it("reds on an empty reason, even for a class the scan genuinely finds", () => {
+		withFixtureTree(
+			{
+				"real-class.ts": [
+					"export class RealClass {",
+					"\tclear(): void {}",
+					"}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const problems = auditContainerClassExclusions({ RealClass: "" }, dir);
+				expect(problems).toEqual([
+					'CONTAINER_CLASS_EXCLUSIONS["RealClass"] has an empty reason',
+				]);
+			},
+		);
+	});
+
+	it("the reviewer's exact probe: a nonexistent class with an EMPTY reason reds on BOTH counts", () => {
+		withFixtureTree(
+			{
+				"real-class.ts": [
+					"export class RealClass {",
+					"\tclear(): void {}",
+					"}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const problems = auditContainerClassExclusions(
+					{ NonexistentClass: "" },
+					dir,
+				);
+				expect(problems).toHaveLength(2);
+			},
+		);
+	});
+
+	it("passes clean for a real class name with a real reason", () => {
+		withFixtureTree(
+			{
+				"real-class.ts": [
+					"export class RealClass {",
+					"\tclear(): void {}",
+					"}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const problems = auditContainerClassExclusions(
+					{ RealClass: "proven stateless — no instance fields at all" },
+					dir,
+				);
+				expect(problems).toEqual([]);
 			},
 		);
 	});

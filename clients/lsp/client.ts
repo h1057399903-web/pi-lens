@@ -308,6 +308,15 @@ export interface LSPClientInfo {
 	 * capability-accessor pattern (`getRawCapabilityKeys`, `getLaunchVariant`).
 	 */
 	pingLiveness?: (timeoutMs?: number) => Promise<boolean>;
+	/**
+	 * #2358: the OS pid of the server's live process tree (the direct child;
+	 * on Windows a `cmd`/`.cmd` shim's pid, whose real descendant does the
+	 * work). The notify-stall breaker's liveness discriminator samples this
+	 * pid's CPU to tell a busy server from a dead input path before tearing it
+	 * down. Optional because test/mock clients model no real process — a
+	 * client without it keeps the pre-#2358 demote-at-budget behavior.
+	 */
+	getProcessPid?: () => number | undefined;
 	notify: {
 		open(
 			filePath: string,
@@ -485,6 +494,17 @@ export interface LSPClientInfo {
 	documentSymbol(filePath: string): Promise<LSPSymbol[]>;
 	/** Whether this exact document has already been opened on the server. */
 	isDocumentOpen(filePath: string): boolean;
+	/**
+	 * Every document currently open on this server, as normalized path keys
+	 * (#2430). Read-only over state already held in memory — it opens nothing,
+	 * closes nothing, and stats nothing. Used by the observational mutation
+	 * net's tracked-file set, which must never walk the workspace.
+	 *
+	 * Optional for the same reason `isBusy` is: a test double or a future client
+	 * shape may not implement it, and the sweep it feeds is advisory — a client
+	 * that cannot enumerate simply contributes no paths.
+	 */
+	openDocumentPaths?(): string[];
 	/** Whether this client currently has an LSP request in flight. */
 	isBusy?(): boolean;
 	/** URI spelling used when this document was opened. */
@@ -541,6 +561,31 @@ export interface LSPClientInfo {
 		item: LSPCallHierarchyItem,
 	): Promise<LSPCallHierarchyOutgoingCall[]>;
 	shutdown(options?: LSPShutdownOptions): Promise<void>;
+}
+
+/**
+ * One document-notification queue entry. A queued entry has not started its
+ * transport write yet, so replacing it cannot leave the server with a partial
+ * protocol message. Once `run` starts, the entry is never replaced; a newer
+ * document state waits behind it and supersedes only the still-pending entry.
+ */
+interface PendingDocumentNotify {
+	run: (coalescedCount: number) => Promise<void>;
+	waiters: Array<{
+		resolve: () => void;
+		reject: (error: unknown) => void;
+	}>;
+	coalescedCount: number;
+}
+
+/**
+ * Per-file queue state. The map itself is per LSP client, so the key pair is
+ * effectively (client, normalized path). Different files retain independent
+ * queues and therefore retain the existing parallel-send behavior.
+ */
+interface DocumentNotifyQueue {
+	pending?: PendingDocumentNotify;
+	running: boolean;
 }
 
 // --- Constants ---
@@ -901,8 +946,8 @@ export interface LSPClientState {
 	 *  above; readers fold their input through `normalizeMapKey`. */
 	readonly diagnosticsVersionsByPath: Map<string, number>;
 	readonly documentVersions: Map<string, number>;
-	/** #2113: tails for same-path didChange sends; different paths stay parallel. */
-	readonly notifyChangeQueues: Map<string, Promise<void>>;
+	/** #2113/#2357: latest-pending same-path document sends; different paths stay parallel. */
+	readonly notifyChangeQueues: Map<string, DocumentNotifyQueue>;
 	/** The LSP document version (`publishDiagnostics.version`) the cached
 	 *  diagnostics for a path were computed against. Only set when the server
 	 *  reports a version; absent entries mean "version unknown" and are treated
@@ -1066,9 +1111,26 @@ export interface LSPClientState {
 	 * disk whenever it likes — only as the direct effect of an opted-in command).
 	 */
 	serverEditsAllowed: number;
-	/** One active command context is safe to associate with a nested applyEdit.
-	 * Concurrent commands deliberately clear this rather than cross-correlate. */
+	/**
+	 * One active command context is safe to associate with a nested applyEdit.
+	 * Concurrent commands deliberately clear this rather than cross-correlate.
+	 * DERIVED, never a stack: assigned only by `syncMutationContextSlot`
+	 * (below in this file), which holds `mutationContextOwner` here while
+	 * exactly one frame is in flight (`activeMutationDepth === 1`) and empties
+	 * it otherwise. Frames OVERLAP without nesting and settle in any order, so
+	 * no per-frame history — neither "put back what I saved" nor "put it back
+	 * while some owner is live" — can decide this: whose window an incoming
+	 * edit belongs to is a function of the CURRENT frame set, not of any one
+	 * frame's bookkeeping (#2479 review rounds 2/3).
+	 */
 	activeMutationContext?: LspMutationContext;
+	/**
+	 * The context of the frame that took `activeMutationDepth` 0 -> 1, held
+	 * for that frame's whole lifetime — including while deeper or overlapping
+	 * frames are open. Written only by that frame (set on entry, cleared on
+	 * unwind); `activeMutationContext` is derived from it and the depth.
+	 */
+	mutationContextOwner?: LspMutationContext;
 	activeMutationDepth?: number;
 	readonly serverId: string;
 	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts). Undefined =
@@ -1629,7 +1691,7 @@ function retirePullSource(state: LSPClientState, identifier: string): void {
 	const suffix = `${PULL_SOURCE_KEY_SEPARATOR}${identifier}`;
 	for (const source of [state.pullResultIds, state.pullRequestSequences]) {
 		if (!source) continue;
-		for (const key of [...source.keys()]) {
+		for (const key of source.keys()) {
 			if (key.endsWith(suffix)) source.delete(key);
 		}
 	}
@@ -1898,6 +1960,7 @@ function recordSentContent(
 	normalizedPath: string,
 	version: number,
 	content: string,
+	coalescedCount = 0,
 ): void {
 	const scan = scanSentContent(content);
 	const previous = state.documentContentHashes.get(normalizedPath);
@@ -2012,6 +2075,7 @@ function recordSentContent(
 			version,
 			contentLength: content.length,
 			contentLineCount: scan.lfNewlineCount + 1,
+			...(coalescedCount > 0 && { coalescedCount }),
 		},
 	});
 }
@@ -2476,15 +2540,33 @@ export function setupIncomingHandlers(
 			if (state.serverEditsAllowed <= 0 || !params?.edit) {
 				return { applied: false, failureReason: "edit not solicited" };
 			}
-			const context =
-				(state.activeMutationDepth ?? 0) === 1
-					? state.activeMutationContext
-					: undefined;
+			// #2450 fix round 3 (F3) removed a `depth === 1` re-check here as
+			// dead code. It is not dead — it moved to the WRITE side, where it
+			// is the live invariant: `state.activeMutationContext` is assigned
+			// only by `syncMutationContextSlot` (below in this file), which
+			// populates it exactly when `activeMutationDepth === 1` and
+			// empties it on every other frame transition. The depth test
+			// therefore still runs, on each entry and each unwind; repeating
+			// it here would be a second copy of the same predicate, not an
+			// independent gate. What this handler reads is consequently either
+			// the context of the single frame currently in flight or
+			// `undefined` — never a settled frame's context, and never a
+			// context belonging to some other window that is still open
+			// (#2479 review rounds 2/3).
+			const context = state.activeMutationContext;
+			// `workspace/applyEdit` is only ever honored inside the
+			// `serverEditsAllowed` window this handler just checked, which is
+			// opened exclusively by an executeCommand call — so a fallback here is
+			// always executeCommand-solicited, never a bare edit (#2450). This
+			// fallback context carries no runtime/cacheManager (there is no live
+			// reference to those singletons at this call site); lsp-mutation.ts's
+			// bookkeepLspMutation falls back to the mutation bridge for exactly
+			// that reason rather than silently dropping the write's bookkeeping.
 			const telemetryContext: LspMutationContext = context ?? {
 				cwd: state.root,
 				correlationId: newLspMutationCorrelationId(),
 				tool: "lsp-workspace-applyEdit",
-				source: "lsp-edit",
+				source: "lsp-execute-command",
 			};
 			try {
 				await applyWorkspaceEdit(
@@ -3752,13 +3834,14 @@ export function handleNotifyExternalChange(
 	state.watchQueue.enqueue(uri, type);
 }
 
-export async function handleNotifyOpen(
+async function handleNotifyOpenOnce(
 	state: LSPClientState,
 	filePath: string,
 	content: string,
 	languageId: string,
 	preserveDiagnostics = false,
 	silent = false,
+	coalescedCount = 0,
 ): Promise<void> {
 	if (!isClientAlive(state)) return;
 	const normalizedPath = normalizeMapKey(filePath);
@@ -3813,7 +3896,13 @@ export async function handleNotifyOpen(
 			// #1669 review F7: only mirror the send locally once it actually left
 			// the process — see safeSendNotification's doc comment.
 			if (reopenSent)
-				recordSentContent(state, normalizedPath, version, content);
+				recordSentContent(
+					state,
+					normalizedPath,
+					version,
+					content,
+					coalescedCount,
+				);
 			state.openDocuments.add(normalizedPath);
 			state.openDocumentUris?.set(normalizedPath, uri);
 			return;
@@ -3826,7 +3915,14 @@ export async function handleNotifyOpen(
 				contentChanges: buildContentChanges(state, normalizedPath, content),
 			},
 		);
-		if (changeSent) recordSentContent(state, normalizedPath, version, content);
+		if (changeSent)
+			recordSentContent(
+				state,
+				normalizedPath,
+				version,
+				content,
+				coalescedCount,
+			);
 		return;
 	}
 
@@ -3866,7 +3962,8 @@ export async function handleNotifyOpen(
 		"textDocument/didOpen",
 		{ textDocument: { uri, languageId, version: 0, text: content } },
 	);
-	if (openSent) recordSentContent(state, normalizedPath, 0, content);
+	if (openSent)
+		recordSentContent(state, normalizedPath, 0, content, coalescedCount);
 	state.pendingOpens.delete(normalizedPath);
 	state.openDocuments.add(normalizedPath);
 	state.closedDocuments?.delete(normalizedPath);
@@ -3893,11 +3990,104 @@ export async function handleNotifyOpen(
 	});
 }
 
+/**
+ * Replace only notifications that have not started a transport write. A
+ * microtask starts the first entry so a synchronous burst of callers installs
+ * one latest entry before any bytes are handed to vscode-jsonrpc. Once an
+ * entry starts, it runs to completion; LSP has no cancellation/acknowledgement
+ * for notifications, so dropping a started write could violate didOpen before
+ * didChange ordering or leave a partial message in the pipe.
+ */
+function enqueueDocumentNotify(
+	state: LSPClientState,
+	normalizedPath: string,
+	run: (coalescedCount: number) => Promise<void>,
+): Promise<void> {
+	let queue = state.notifyChangeQueues.get(normalizedPath);
+	if (!queue) {
+		queue = { running: false };
+		state.notifyChangeQueues.set(normalizedPath, queue);
+	}
+	return new Promise<void>((resolve, reject) => {
+		const previous = queue?.pending;
+		// Keep superseded callers attached to the replacement's completion. The
+		// notification is dropped, but callers such as the auxiliary backlog
+		// ledger must not observe completion before the newest content is sent.
+		const waiters = previous?.waiters ?? [];
+		waiters.push({ resolve, reject });
+		queue!.pending = {
+			run,
+			waiters,
+			coalescedCount: (previous?.coalescedCount ?? 0) + (previous ? 1 : 0),
+		};
+		if (queue!.running) return;
+		queue!.running = true;
+		// Let same-turn callers replace the unwritten entry before the runner
+		// invokes the transport. Different path queues still start independently.
+		void Promise.resolve().then(async () => {
+			try {
+				for (;;) {
+					const next = queue!.pending;
+					if (!next) break;
+					queue!.pending = undefined;
+					try {
+						await next.run(next.coalescedCount);
+						for (const waiter of next.waiters) waiter.resolve();
+					} catch (error) {
+						for (const waiter of next.waiters) waiter.reject(error);
+					}
+				}
+			} finally {
+				queue!.running = false;
+				if (
+					!queue!.pending &&
+					state.notifyChangeQueues.get(normalizedPath) === queue
+				) {
+					state.notifyChangeQueues.delete(normalizedPath);
+				}
+			}
+		});
+	});
+}
+
+/** Drop unwritten document notifications when a client is torn down. */
+function cancelDocumentNotifyQueues(state: LSPClientState): void {
+	for (const queue of state.notifyChangeQueues.values()) {
+		for (const waiter of queue.pending?.waiters ?? []) waiter.resolve();
+		queue.pending = undefined;
+	}
+	state.notifyChangeQueues.clear();
+}
+
+export function handleNotifyOpen(
+	state: LSPClientState,
+	filePath: string,
+	content: string,
+	languageId: string,
+	preserveDiagnostics = false,
+	silent = false,
+): Promise<void> {
+	if (!isClientAlive(state)) return Promise.resolve();
+	const normalizedPath = normalizeMapKey(filePath);
+	return enqueueDocumentNotify(state, normalizedPath, (coalescedCount) =>
+		handleNotifyOpenOnce(
+			state,
+			filePath,
+			content,
+			languageId,
+			preserveDiagnostics,
+			silent,
+			coalescedCount,
+		),
+	);
+}
+
 async function handleNotifyChangeOnce(
 	state: LSPClientState,
 	filePath: string,
 	content: string,
 	normalizedPath: string,
+	coalescedCount = 0,
 ): Promise<void> {
 	if (!isClientAlive(state)) return;
 	const uri =
@@ -3921,7 +4111,8 @@ async function handleNotifyChangeOnce(
 		state.documentVersions.set(normalizedPath, 0);
 		state.documentOpenedAt.set(normalizedPath, Date.now());
 		state.diagnosticPublicationCounts.set(normalizedPath, 0);
-		if (fallbackOpenSent) recordSentContent(state, normalizedPath, 0, content);
+		if (fallbackOpenSent)
+			recordSentContent(state, normalizedPath, 0, content, coalescedCount);
 		state.openDocuments.add(normalizedPath);
 		state.openDocumentUris?.set(normalizedPath, uri);
 		return;
@@ -3940,7 +4131,8 @@ async function handleNotifyChangeOnce(
 			contentChanges: buildContentChanges(state, normalizedPath, content),
 		},
 	);
-	if (changeSent) recordSentContent(state, normalizedPath, version, content);
+	if (changeSent)
+		recordSentContent(state, normalizedPath, version, content, coalescedCount);
 }
 
 /**
@@ -3955,20 +4147,15 @@ export function handleNotifyChange(
 ): Promise<void> {
 	if (!isClientAlive(state)) return Promise.resolve();
 	const normalizedPath = normalizeMapKey(filePath);
-	const previous =
-		state.notifyChangeQueues.get(normalizedPath) ?? Promise.resolve();
-	const queued = previous
-		.catch(() => undefined)
-		.then(() =>
-			handleNotifyChangeOnce(state, filePath, content, normalizedPath),
-		);
-	const settled = queued.finally(() => {
-		if (state.notifyChangeQueues.get(normalizedPath) === settled) {
-			state.notifyChangeQueues.delete(normalizedPath);
-		}
-	});
-	state.notifyChangeQueues.set(normalizedPath, settled);
-	return settled;
+	return enqueueDocumentNotify(state, normalizedPath, (coalescedCount) =>
+		handleNotifyChangeOnce(
+			state,
+			filePath,
+			content,
+			normalizedPath,
+			coalescedCount,
+		),
+	);
 }
 
 /** Close a document through the same lifecycle path exposed by the client. */
@@ -4130,6 +4317,9 @@ async function clientShutdownOnce(
 	state.pendingOpens.clear();
 	state.openDocuments.clear();
 	state.openDocumentUris?.clear();
+	// #2357: superseded notifications that have not started writing are moot
+	// once this client is dead; resolve their callers and release the queue.
+	cancelDocumentNotifyQueues(state);
 	// #1412 L1: mirror openDocuments' clear — a shut-down/evicted client's
 	// probe memo is moot along with everything else document-scoped.
 	state.projectIdentityProbedFiles?.clear();
@@ -4635,6 +4825,36 @@ async function clientPingLiveness(
 	return isClientAlive(state);
 }
 
+// #2479: `activeMutationContext` is DERIVED state, not a stack. The frame that
+// takes `activeMutationDepth` 0 -> 1 owns the context for its whole lifetime
+// (`mutationContextOwner`); the slot merely exposes that owner while it is the
+// ONLY frame in flight. Deeper or overlapping frames therefore empty the slot
+// for as long as they are open — concurrent and nested commands deliberately
+// do not cross-correlate — and it refills by itself when they unwind, with no
+// frame having to remember anything.
+//
+// Recomputing beats saving and restoring because these frames do not nest:
+// `LSPClient.executeCommand` and `LSPService.executeCommand` fan out with no
+// mutex, parallel `lsp_navigation` calls with `apply: true` overlap, and #449
+// light mode shares one client across agents. With A (the owner), B and C
+// overlapping and the MIDDLE one settling first, a per-frame restore hands A's
+// context back while C's window is the open one — and `LspMutationContext`
+// carries a cwd plus a directly-threaded runtime/cacheManager, with
+// `readTurnState` / `appendProjectChange` cwd-scoped, so that routes a live
+// edit's bookkeeping into another project's change log (strictly worse than
+// the honest fallback the pre-#2479 code gave). An owner-liveness flag does
+// not fix it either: it answers "is an owner live", not "does the slot belong
+// to the window this edit is in" — and C's own unwind then puts back the
+// `undefined` it saved while the owner is still running, resurrecting #2479
+// (review round 3). Deriving answers the second question by construction, and
+// "no command in flight == no context" — the invariant the
+// `serverEditsAllowed` gate on `workspace/applyEdit` is paired with — falls
+// out of it with no depth-0 special case.
+function syncMutationContextSlot(state: LSPClientState): void {
+	state.activeMutationContext =
+		state.activeMutationDepth === 1 ? state.mutationContextOwner : undefined;
+}
+
 // Run an advertised server command via workspace/executeCommand, with the
 // generous EXECUTE_COMMAND_TIMEOUT_MS anti-deadlock backstop. Preserves the
 // hardening invariants: allowlist-by-advertisement (only commands the server
@@ -4659,9 +4879,20 @@ export async function runServerCommand(
 	}
 	state.serverEditsAllowed += 1;
 	state.activeMutationDepth = (state.activeMutationDepth ?? 0) + 1;
-	if (state.activeMutationDepth === 1)
-		state.activeMutationContext = mutationContext;
-	else state.activeMutationContext = undefined;
+	// #2479: the frame that takes the depth to 1 owns the context; the slot is
+	// derived from that owner (see `syncMutationContextSlot` above). The
+	// pre-#2479 shape only ever CLEARED the slot, and only once the depth
+	// returned to 0, so a nested `executeCommand` unwinding from depth 2 back
+	// to 1 left the OUTER call without its own context for the rest of its
+	// window: every server-initiated `applyEdit` it still solicited read
+	// `undefined`, fell to the mutation bridge, and carried the generic
+	// `agent-tool:lsp-workspace-applyEdit` receipt instead of the outer
+	// operation's own (`lsp-rename` / `lsp-execute-command`).
+	const isMutationContextOwner = state.activeMutationDepth === 1;
+	if (isMutationContextOwner) {
+		state.mutationContextOwner = mutationContext;
+	}
+	syncMutationContextSlot(state);
 	try {
 		let result: unknown;
 		try {
@@ -4692,8 +4923,15 @@ export async function runServerCommand(
 			0,
 			(state.activeMutationDepth ?? 0) - 1,
 		);
-		if (state.activeMutationDepth === 0)
-			state.activeMutationContext = undefined;
+		// The owner drops its context; every frame then resyncs. Both the
+		// hand-back to a still-live owner once the deeper frames unwind and
+		// the empty slot while more than one frame is open are consequences of
+		// the derivation, not separate rules each frame has to get right
+		// (#2479 review rounds 2/3).
+		if (isMutationContextOwner) {
+			state.mutationContextOwner = undefined;
+		}
+		syncMutationContextSlot(state);
 	}
 }
 
@@ -5303,6 +5541,9 @@ export async function createLSPClient(options: {
 		/** #1277: cheap request round-trip proving the server still responds. */
 		pingLiveness: (timeoutMs?: number) => clientPingLiveness(state, timeoutMs),
 
+		/** #2358: the OS pid of the live server process (see interface doc). */
+		getProcessPid: () => lspProcess.pid,
+
 		notify: {
 			async open(filePath, content, languageId, preserveDiagnostics, silent) {
 				return handleNotifyOpen(
@@ -5538,6 +5779,10 @@ export async function createLSPClient(options: {
 
 		isDocumentOpen(filePath) {
 			return state.openDocuments.has(normalizeMapKey(filePath));
+		},
+
+		openDocumentPaths() {
+			return [...state.openDocuments];
 		},
 
 		isBusy() {

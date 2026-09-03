@@ -1,10 +1,17 @@
 /** Bounded, process-local telemetry for behavior degraded during one session. */
 
+import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
 import { logExtension } from "./extension-log.js";
-import { LEDGER_FIELD_MAX, truncateForLedger } from "./ledger-bounds.js";
+import {
+	DEGRADATION_ENTRIES_PER_KIND,
+	LEDGER_FIELD_MAX,
+	truncateForLedger,
+} from "./ledger-bounds.js";
 import { logLatency } from "./latency-logger.js";
 import {
+	getSinkRotations,
 	getSinkWriteFailures,
+	resetSinkRotations,
 	resetSinkWriteFailures,
 } from "./ndjson-logger.js";
 // #2146: pulled at READ time, never pushed. `process-singletons.ts` is a
@@ -16,11 +23,43 @@ import {
 	getProcessSingletonResets,
 	PROCESS_SINGLETON_RESET_KIND,
 } from "./process-singletons.js";
+// #2506: same inversion, same reason — `file-utils.ts` cannot import this
+// module (directly OR dynamically) without closing a no-client-cycles cycle
+// through the existing extension-log.ts/latency-logger.ts/safe-spawn.js path,
+// so `getGlobalPiLensLogDir()`'s probe-home-redirect event is written to this
+// zero-import leaf and read back here instead. See
+// `probe-home-state.ts`'s doc comment for the full account.
+import { getProbeHomeRedirectEvent } from "./probe-home-state.js";
 
 // Re-exported so existing importers keep one name for the ledger's bound.
 export { LEDGER_FIELD_MAX, truncateForLedger };
 
 export type DegradationKind =
+	/**
+	 * #2430: a tool mutated a tracked file but matched no built-in name and no
+	 * mutation shape adapter, so pi-lens could only find the change by diffing
+	 * the disk around the call. Subject is the tool name, recorded ONCE per
+	 * tool, so a session report names every gap in the classification registry
+	 * instead of leaving the observational net's work invisible.
+	 */
+	| "unclassified-mutating-tool"
+	/**
+	 * #2430: an observational capture — the pre-snapshot, the post-diff, or the
+	 * `agent_settled` sweep — hit its per-turn wall-clock budget, timed out, or
+	 * was aborted. The net then has NO opinion about that call, which must be
+	 * visible rather than read as "nothing changed" (catalog shape 10).
+	 */
+	| "observed-mutation-budget"
+	/**
+	 * #2430: an armed observation's universe was TRUNCATED — the tool named a
+	 * directory with more entries than {@link
+	 * clients/observed-mutation.ts#OBSERVED_TARGET_DIR_MAX_ENTRIES}, so the
+	 * entries past the cap were never watched. Subject is the tool name. This
+	 * is deliberately NOT `observed-mutation-budget`: no clock and no byte
+	 * budget was exceeded, and a reader tuning a timeout would be chasing a
+	 * structural cap that no amount of time changes (#2449 review round 3).
+	 */
+	| "observed-mutation-dir-cap"
 	| "trust-refusal"
 	| "mode-suppression"
 	| "ts-idle-eviction"
@@ -59,6 +98,17 @@ export type DegradationKind =
 	| "lsp-warm-client-missing"
 	| "lsp-capability-skip"
 	/**
+	 * A server-initiated `workspace/applyEdit` fell back to the mutation
+	 * bridge (`clients/lsp-mutation.ts`, #2450) because its `LspMutationContext`
+	 * carried no `runtime`/`cacheManager`, and no bridge is mounted in this
+	 * process (`registerMutationBridge` only runs inside pi's own in-process
+	 * extension activation — the standalone MCP server, `mcp/server.ts`,
+	 * never calls it). The write still lands on disk; only its bookkeeping
+	 * (read-guard stamp, turn-state entry, change-log receipt) is lost.
+	 * Subject is the soliciting tool name.
+	 */
+	| "lsp-mutation-bridge-unmounted"
+	/**
 	 * #2007: a worktree-mutating git command was declined because a live peer
 	 * session shares this dirty checkout. The subject is the checkout root, so
 	 * the ledger says WHICH shared directory is contended.
@@ -78,6 +128,17 @@ export type DegradationKind =
 	 */
 	| "review-graph-snapshot-read"
 	/**
+	 * #2477 round 2: `recordEntitySnapshotDiff` (`clients/review-graph/service.ts`)
+	 * received a non-absolute `filePath`. Every production writer
+	 * (`clients/dispatch/runners/tree-sitter.ts`) passes `ctx.filePath`, which
+	 * `createDispatchContext` guarantees is always absolute (the #2016
+	 * invariant) — this is a caller regression, not a runtime condition, so it
+	 * fires at most once per subject (the offending path) and the diff is
+	 * skipped rather than computed under a key the builder's reader could
+	 * never reach. Subject is the raw (unnormalized) `filePath` received.
+	 */
+	| "review-graph-non-absolute-entity-path"
+	/**
 	 * The project-snapshot persist seam detected durable meta/body evidence
 	 * failing the #2008 integrity gate — the meta's recorded gz size no longer
 	 * matches the on-disk body (torn/truncated gzip under an intact meta), or a
@@ -93,11 +154,24 @@ export type DegradationKind =
 	 * checks stay attributable.
 	 */
 	| "test-runner-failed-target-state"
+	/** Automatic test-result delivery could not reach the host entry surface. */
+	| "test-runner-delivery"
 	| "formatter-failure"
+	/**
+	 * A selected formatter's executable was proven absent (#2413): its
+	 * `resolveCommand` probed every install location and PATH and found nothing,
+	 * or the static fallback spawn returned a typed `tool-not-found`. Distinct
+	 * from `formatter-failure` (a tool that ran and failed) precisely so durable
+	 * unavailability is never counted, requeued, or surfaced as a code error.
+	 * Subject is `<formatter>:<basename>`.
+	 */
+	| "formatter-unavailable"
 	| "wasm-abort"
 	| "lsp-diagnostics-timeout"
 	| "lsp-scanner-coverage-gap"
 	| "lsp-notify-inflight-stall"
+	/** A busy notify-stall discriminator was deferred; detail is rising-edge bounded. */
+	| "lsp-notify-stall-cpu-busy"
 	/** A didChange content mirror was recorded behind a newer document version. */
 	| "lsp-document-send-order"
 	| "bus-stale"
@@ -443,6 +517,30 @@ export type DegradationKind =
 	 */
 	| "log-sink-write-failure"
 	/**
+	 * `ndjson-logger.ts` rotated a shared file-sink at its configured
+	 * `maxBytes` bound mid-session (#2505) — the write path itself caught the
+	 * crossing, not the once-per-process `runLogCleanup` session-start sweep
+	 * (which a long-lived process, e.g. the warm MCP server, may never run
+	 * again). Subject is the sink's absolute path, count is the number of
+	 * rotations this session. Same "pulled at READ time" shape as
+	 * `log-sink-write-failure` above and for the same reason:
+	 * `degradation-ledger.ts` already imports `ndjson-logger.ts`
+	 * (`getSinkWriteFailures`), so a reverse import to call
+	 * `recordDegradation`/`recordDegradationOnce` directly from there would
+	 * close a cycle — see `NdjsonWriterState.rotationCount`'s doc comment.
+	 */
+	| "log-sink-rotated"
+	/**
+	 * A rotation that `ndjson-logger.ts` attempted and could NOT complete
+	 * (#2505 review F2) — an unwritable backup path, or the Windows sharing
+	 * violation another process holding the file open produces. This is the
+	 * one that matters: the sink cannot bound itself, so the file keeps
+	 * growing past `maxBytes` until something outside the writer moves it.
+	 * Its sibling above is informational; this one renders as a warning.
+	 * Same read-time pull, same cycle reason.
+	 */
+	| "log-sink-rotate-failed"
+	/**
 	 * A word-index posting named a file id the file table could not resolve to
 	 * a path, so the posting was dropped from a search result or a decoded hit
 	 * list (#2069). Since #2069 a posting carries an integer id rather than a
@@ -499,13 +597,154 @@ export type DegradationKind =
 	 * the ledger still answers which server's earlier finding never resurfaced
 	 * after the count-bound stops naming files.
 	 */
-	| "aux-runner-findings-lost";
+	| "aux-runner-findings-lost"
+	/**
+	 * The napi HTML embedded-`<script>` evaluation (#2347) hit its evaluation
+	 * budget (body-count and/or cumulative body-bytes cap) and dropped the
+	 * remainder without parsing them. Subject is the file path, so the ledger
+	 * says WHICH generated/pathological page keeps losing embedded coverage.
+	 * Counted per file: the exact dropped total matters more than one retained
+	 * reason, and the recorded counts (`scriptElementCount`, `bodiesEvaluated`,
+	 * `truncatedBodies`) make the truncation reconstructable.
+	 */
+	| "ast-grep-napi-html-script-budget"
+	/**
+	 * A `<script>` body of an HTML file the napi runner was evaluating (#2347)
+	 * refused to parse as JavaScript, so that body contributed no embedded
+	 * findings. Subject is the file path; counted so the totals survive the
+	 * ledger's retained-entry window. A parse refusal on a whole file degrades
+	 * that file to "no embedded coverage" like an unparseable `.js` file and is
+	 * recorded as such, never as a clean empty result.
+	 */
+	| "ast-grep-napi-html-script-parse-failed"
+	/**
+	 * The loaded addon exposed no `js` grammar while an HTML file's embedded
+	 * `language: JavaScript` evaluation asked for one (#2347). The embedded
+	 * coverage degrades to nothing for the whole file, silently prior to this
+	 * kind. Once per file per session; subject is the file path.
+	 */
+	| "ast-grep-napi-html-js-grammar-missing"
+	/**
+	 * The `script_element` scan of an HTML root threw while napi prepared the
+	 * embedded-`<script>` evaluation (#2347). The embedded coverage degrades to
+	 * nothing for the file, silently prior to this kind. Once per file per
+	 * session; subject is the file path.
+	 */
+	| "ast-grep-napi-html-script-scan-failed"
+	/**
+	 * A demand for the analyzer bootstrap clients (`clients/bootstrap.ts`)
+	 * could not be served, so the caller PROCEEDED WITHOUT them (#2467). The
+	 * subject is the demand reason — `session-start-scans`,
+	 * `tool-call-complexity-baseline`, … — so the ledger still answers WHICH
+	 * consumer degraded after the bounded records stop; `unavailableReason` in
+	 * the record says which of four SEAM causes fired (the primary session was
+	 * shutting down, the caller's wall-clock ceiling elapsed, the load itself
+	 * rejected, or the strike latch had already closed). A fifth possible
+	 * reason, `aborted` — the caller's OWN signal firing (Escape, a turn
+	 * ending) — is deliberately never written here: that is the caller
+	 * choosing to stop waiting, not the seam degrading, and counting it would
+	 * make a user's cancel read as an unhealthy analyzer graph. Counted rather
+	 * than once-per-session: the load is retried on the next demand, so the
+	 * number of failed demands is the observability question. Fail-open is the
+	 * whole point — without this kind, an analyzer silently not running and an
+	 * analyzer finding nothing read identically (AGENTS.md shape 10).
+	 */
+	| "analyzer-bootstrap-unavailable"
+	/**
+	 * The analyzer bootstrap stopped rebuilding after
+	 * `BOOTSTRAP_FAILURE_STRIKE_LIMIT` consecutive failed loads (#2467 review).
+	 * Recorded ONCE per session, because that is exactly what it reports: a
+	 * state change, not a rate. The per-demand degradations that follow keep
+	 * arriving under `analyzer-bootstrap-unavailable` with
+	 * `unavailableReason: "latched"`, so the ledger still answers both "how
+	 * often did a consumer degrade" and "why did it stop even trying".
+	 */
+	| "analyzer-bootstrap-latched"
+	/**
+	 * A config file the user wrote — or one key inside it — was rejected and
+	 * IGNORED, so pi-lens ran on defaults instead of on what the user asked for
+	 * (#2418). Written only through `warnIgnoredConfigOnce`
+	 * (`clients/config-warn.ts`), the single seam behind all three config
+	 * loaders. Before this kind the rejection existed only as a log line and a
+	 * one-shot notification: nothing counted it, so a session could silently run
+	 * the whole time on defaults with no durable trace. Subject is
+	 * `<file>\0<key>` (empty key = the whole file was unreadable), so a per-key
+	 * rejection and a whole-file rejection stay distinct rows for the same path;
+	 * `metadata.subsystem` says which loader. Once per subject per session — a
+	 * config is re-read on many paths and the count of re-reads is not the
+	 * observability question, the fact of the ignore is. This is the only kind
+	 * that carries a `code` (`PILENS_CFG_0001`) into the durable row.
+	 */
+	| "config-ignored"
+	/**
+	 * A config file location or root key the user wrote is DEPRECATED and was
+	 * still honored (#2426). The deliberate opposite of `config-ignored`: the
+	 * setting applied exactly as written, and the location it was written in is
+	 * on the removal schedule in `DEPRECATED_CONFIG_SURFACES`. Kept as its own
+	 * kind so "how many sessions ran on defaults because a config was rejected"
+	 * stays answerable from the ledger without subtracting deprecations out of
+	 * it. Same producer and same `<file>\0<key>` subject as `config-ignored`,
+	 * one row per `(file, key)` per session, carrying `PILENS_CFG_0002`
+	 * (deprecated key) or `PILENS_CFG_0003` (deprecated file location).
+	 */
+	| "config-deprecated"
+	/**
+	 * A config file's NOTICE LIST was truncated by the per-resolution bound, and
+	 * this row carries how many notices were summarised away (#2426 review round
+	 * 6). Written through `warnIgnoredConfigOnce` like the two kinds above,
+	 * under `PILENS_CFG_0007`, with the same `<file>` subject.
+	 *
+	 * Its own kind because it is a fact about the OUTPUT, not about the config:
+	 * a legacy file whose every setting was applied still overflows the bound,
+	 * and recording that under `config-ignored` — which it did before this kind
+	 * existed — both told the user their valid file was being ignored and made
+	 * "how many sessions ran on defaults because a config was rejected"
+	 * unanswerable, since the ledger could no longer tell a rejection from a
+	 * long list. One row per file per session.
+	 */
+	| "config-notice-suppressed"
+	/**
+	 * `getGlobalPiLensLogDir()` (`clients/file-utils.ts`, #2506) redirected the
+	 * LOG/ledger root away from the real `~/.pi-lens` because `PI_LENS_HOME`
+	 * was unset outside test mode and the process's `cwd` looked like a
+	 * probe context (inside a specific `.claude/worktrees/<worktree>/` or under
+	 * `os.tmpdir()`), or `PILENS_PROBE=1` forced the redirect. Without this kind
+	 * a probe run outside vitest that forgot to pin `PI_LENS_HOME` would
+	 * silently write into the maintainer's real telemetry with no durable trace
+	 * — the exact gap that let two review probes leave 42 fixture rows in real
+	 * `~/.pi-lens` files on 2026-09-02. Subject is the redirected probe-home
+	 * path.
+	 *
+	 * Scope note (#2506 round 3): only the log family moves.
+	 * `getGlobalPiLensDir()` — installed tools, `bin/`, `instances.json`, the
+	 * orphan-backstop lease, the probe cache, the global `config.json`, LSP
+	 * server storage — stays cwd-independent, so a pi session running from a
+	 * worktree keeps its tools and stays visible to the machine-wide registry.
+	 * This row therefore means "telemetry was diverted", never "this session
+	 * lost its tools".
+	 *
+	 * Never written via `recordDegradation`/`recordDegradationOnce` like every
+	 * other kind above — the same `log-sink-write-failure`/
+	 * `process-singleton-reset` shape: it is folded into
+	 * `getDegradationSummary()` at READ time from `probe-home-state.ts`'s own
+	 * process-scoped event, because `file-utils.ts` cannot import this module
+	 * (directly OR dynamically) without closing a `no-client-cycles` violation
+	 * through the existing `extension-log.ts`/`latency-logger.ts`/
+	 * `safe-spawn.js` cycle. See `probe-home-state.ts`'s doc comment.
+	 */
+	| "global-dir-probe-redirect";
 
 export interface DegradationRecord {
 	kind: unknown;
 	subject: unknown;
 	reason: unknown;
 	metadata?: Record<string, unknown>;
+	/**
+	 * Optional STABLE config diagnostic code (#2418). Reserved row field: it is
+	 * written into the durable row AFTER the bounded caller metadata, so the
+	 * `MAX_METADATA_KEYS` cap can never evict the one field a user greps on.
+	 */
+	code?: ConfigDiagnosticCode;
 }
 
 export interface DegradationGroup {
@@ -517,7 +756,7 @@ export interface DegradationGroup {
 	latestReasons: Array<{ subject: string; reason: string }>;
 }
 
-const ENTRIES_PER_KIND = 20;
+const ENTRIES_PER_KIND = DEGRADATION_ENTRIES_PER_KIND;
 const MAX_DISTINCT_KINDS = 32;
 const OVERFLOW_KIND = "other";
 const groups = new Map<
@@ -574,7 +813,7 @@ export function recordDegradationOnce(record: DegradationRecord): void {
 		if (onceKeys.has(key)) return;
 		onceKeys.add(key);
 		if (recordDegradation({ kind, subject, reason: record.reason })) {
-			logDurableDegradation(kind, subject, 1, record.metadata);
+			logDurableDegradation(kind, subject, 1, record.metadata, record.code);
 		}
 	} catch (error) {
 		debugLedgerFailure("record-once", error);
@@ -623,7 +862,7 @@ export function incrementDegradationCount(record: DegradationRecord): boolean {
 		// Durable rows use the summary's admission and emit the first event and
 		// power-of-two milestones only, keeping the sink bounded.
 		if (admitted && isPowerOfTwo(count)) {
-			logDurableDegradation(kind, subject, count, record.metadata);
+			logDurableDegradation(kind, subject, count, record.metadata, record.code);
 		}
 		return count === 1;
 	} catch (error) {
@@ -644,6 +883,7 @@ function logDurableDegradation(
 	subject: string,
 	count: number,
 	metadata?: Record<string, unknown>,
+	code?: ConfigDiagnosticCode,
 ): void {
 	const boundedMetadata = boundLedgerMetadata(metadata);
 	logLatency({
@@ -657,6 +897,9 @@ function logDurableDegradation(
 			subject,
 			count,
 			ledgerGeneration,
+			// Reserved row field, written AFTER the bounded caller metadata so the
+			// `MAX_METADATA_KEYS` cap cannot evict the stable code (#2418).
+			...(code ? { code } : {}),
 		},
 	});
 }
@@ -712,6 +955,42 @@ export function getDegradationSummary(): DegradationGroup[] {
 			})),
 		});
 	}
+	// #2505, same read-time fold: a mid-session rotation is visible without
+	// this module writing about it through the very sink family it is
+	// reporting on — see the `log-sink-rotated` doc comment on
+	// `DegradationKind`.
+	const sinkRotations = getSinkRotations();
+	const rotated = sinkRotations.filter((sink) => sink.rotationCount > 0);
+	if (rotated.length > 0) {
+		summary.push({
+			kind: "log-sink-rotated",
+			count: rotated.reduce((total, sink) => total + sink.rotationCount, 0),
+			droppedCount: 0,
+			latestReasons: rotated.map((sink) => ({
+				subject: truncateForLedger(sink.file),
+				reason: truncateForLedger(
+					`${sink.rotationCount} rotation(s) at the configured byte bound`,
+				),
+			})),
+		});
+	}
+	// A rotation the writer ATTEMPTED and could not complete is a different
+	// fact from a rotation that happened, and the only signal that a sink is
+	// growing past its bound right now (#2505 review F2).
+	const rotateFailed = sinkRotations.filter((sink) => sink.failureCount > 0);
+	if (rotateFailed.length > 0) {
+		summary.push({
+			kind: "log-sink-rotate-failed",
+			count: rotateFailed.reduce((total, sink) => total + sink.failureCount, 0),
+			droppedCount: 0,
+			latestReasons: rotateFailed.map((sink) => ({
+				subject: truncateForLedger(sink.file),
+				reason: truncateForLedger(
+					`${sink.failureCount} failed rotation attempt(s); this sink is growing past its byte bound`,
+				),
+			})),
+		});
+	}
 	// #2146, same read-time fold: process-singleton resets live in the leaf
 	// module's own bounded log. One entry per family, so this group's count is
 	// the number of families this build could not adopt, never an event tally.
@@ -725,6 +1004,25 @@ export function getDegradationSummary(): DegradationGroup[] {
 				subject: truncateForLedger(reset.family),
 				reason: truncateForLedger(reset.reason),
 			})),
+		});
+	}
+	// #2506, same read-time fold: `getGlobalPiLensLogDir()`'s probe-home redirect
+	// fires at most once per process (see `file-utils.ts`), so this is a
+	// presence check, not a tally.
+	const probeHomeRedirect = getProbeHomeRedirectEvent();
+	if (probeHomeRedirect) {
+		summary.push({
+			kind: "global-dir-probe-redirect",
+			count: 1,
+			droppedCount: 0,
+			latestReasons: [
+				{
+					subject: truncateForLedger(probeHomeRedirect.probeHome),
+					reason: truncateForLedger(
+						`PI_LENS_HOME unset outside test mode with cwd in a worktree/tmp probe context (${probeHomeRedirect.cwd}); LOGS redirected away from the real home directory (tools, bin and instances.json are unaffected)`,
+					),
+				},
+			],
 		});
 	}
 	return summary;
@@ -750,6 +1048,19 @@ function isRenderableSummary(value: unknown): value is DegradationGroup[] {
 	});
 }
 
+/**
+ * Kinds that record something the system did ON PURPOSE, correctly, and
+ * that a reader only needs a tally of — never a call to action (#2505
+ * review). A routine log rotation at the configured bound is the writer
+ * working as designed; giving it the same warning marker a real
+ * degradation gets trains the reader to ignore the marker. The FAILED
+ * rotation is the line that has to stand out, so it is deliberately NOT
+ * in this set.
+ */
+const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
+	"log-sink-rotated",
+]);
+
 export function renderDegradationLines(
 	summary: unknown = getDegradationSummary(),
 ): string[] {
@@ -758,6 +1069,9 @@ export function renderDegradationLines(
 	return [
 		"Degradations:",
 		...summary.map((group) => {
+			if (INFORMATIONAL_DEGRADATION_KINDS.has(group.kind)) {
+				return `  ${group.kind}: ${group.count}`;
+			}
 			const latest = group.latestReasons.at(-1);
 			return `  ⚠ ${group.kind}: ${group.count}${latest ? ` — ${latest.subject}: ${latest.reason}` : ""}`;
 		}),
@@ -786,6 +1100,10 @@ export function resetDegradationLedger(): void {
 	// process-lifetime latch too — it re-arms alongside the rest of the
 	// ledger rather than surviving past the session that observed it.
 	resetSinkWriteFailures();
+	// #2505, same catalog shape 17 re-arm: a rotation tally recurs (new writes
+	// keep crossing the bound), so clearing it costs nothing and a later
+	// session re-observes the fact fresh.
+	resetSinkRotations();
 	// #2146 review F3: the OTHER pulled source, `getProcessSingletonResets()`,
 	// deliberately does NOT re-arm here, and the difference from its neighbour
 	// above is the point. A sink write failure recurs — new writes fail, so
@@ -798,7 +1116,18 @@ export function resetDegradationLedger(): void {
 	// session (one entry per family, capped at 16), so leaving it costs a fixed
 	// handful of lines and keeps a process-scope fact visible for the process's
 	// life. Deliberate exception to catalog shape 17, not an oversight.
+	//
+	// `getProbeHomeRedirectEvent()` (#2506) is the same shape as the
+	// process-singleton case above and for the same reason: the redirect is
+	// resolved at most once per PROCESS (memoized in the `globalThis` slot
+	// `probe-home-state.ts` owns, not a session-scoped one), so it cannot
+	// recur within this process's life either — clearing it here would hide
+	// the fact from every session after the first in the same probe process.
 }
 
-export const DEGRADATION_ENTRIES_PER_KIND = ENTRIES_PER_KIND;
+// Re-exported so every existing importer keeps its specifier. The value now
+// lives in the `ledger-bounds.js` leaf (#2426), so a producer that only needs
+// the BOUND does not have to import the ledger — and cannot be broken by a test
+// that mocks it wholesale.
+export { DEGRADATION_ENTRIES_PER_KIND };
 export const DEGRADATION_MAX_DISTINCT_KINDS = MAX_DISTINCT_KINDS;
