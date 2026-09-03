@@ -16,7 +16,7 @@ upstream.
 | Downstream integration branch | `master` |
 | Downstream release/default branch | `stable` |
 | Bootstrap base | `ccf33b136d1fd46399ecddf9264531af03024d58` (`v4.1.3`) |
-| Last synced upstream commit | `ccf33b136d1fd46399ecddf9264531af03024d58` (`v4.1.3`) |
+| Last synced upstream commit | `74f934dcf8ea04c15b88c203de2950a38ce719ac` (post-`v4.1.3`, 427 commits) |
 
 ## Intentional downstream changes
 
