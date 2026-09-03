@@ -10,6 +10,7 @@
     "module_report",
     "read_symbol",
     "read_enclosing",
+    "effective_config",
     "pi_lens_activate_tools"
   ],
   "requiredCommands": [

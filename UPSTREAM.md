@@ -16,7 +16,7 @@ upstream.
 | Downstream integration branch | `master` |
 | Downstream release/default branch | `stable` |
 | Bootstrap base | `ccf33b136d1fd46399ecddf9264531af03024d58` (`v4.1.3`) |
-| Last synced upstream commit | `74f934dcf8ea04c15b88c203de2950a38ce719ac` (post-`v4.1.3`, 427 commits) |
+| Last synced upstream commit | `97c02b1763760c97a05f0bfd65ee62d33ddf002b` (post-`v4.1.3`, 463 commits) |
 
 ## Intentional downstream changes
 
@@ -72,16 +72,19 @@ surface. `dist/` is generated, never committed.
 
 ## Diagnostics compatibility surface
 
-pi-lens registers fourteen tools. Eight are always active:
+pi-lens registers fifteen tools. Nine are always active:
 `lens_diagnostics`, `lsp_diagnostics`, `symbol_search`, `project_report`,
-`module_report`, `read_symbol`, `read_enclosing`, and the activation loader
-`pi_lens_activate_tools`. Six situational tools (`ast_grep_search`,
+`module_report`, `read_symbol`, `read_enclosing`, `effective_config`, and
+the activation loader `pi_lens_activate_tools`; `effective_config` joined
+the always-active tier in the `74f934dcf`→`97c02b17` freshness range
+(upstream `tools/effective-config.ts`). Six situational tools (`ast_grep_search`,
 `ast_grep_replace`, `ast_grep_outline`, `ast_grep_dump`, `lsp_navigation`,
 `lens_diagnostic_mark`) are registered but deactivated on `session_start` by
 upstream design and become visible only after `pi_lens_activate_tools`. The
 compatibility manifest therefore requires only the deterministic
 always-active tier, which includes the two diagnostics tools at the core of
-this lane's compatibility review, plus all nine `lens-*` commands.
+this lane's compatibility review, plus all nine `lens-*` commands. The lazy
+tier and the command set are unchanged by the freshness range.
 
 ## Branch and consumer contract
 
