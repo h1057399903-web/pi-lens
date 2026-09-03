@@ -4,6 +4,12 @@ features.md
 
 # pi-lens internal
 .pi-lens/
+# Probe-home redirect target (#2506): getGlobalPiLensLogDir() sends the logs
+# of a probe run without a PI_LENS_HOME pin here instead of the real
+# ~/.pi-lens. Untracked by design -- if it were not ignored, every agent
+# worktree that ran one probe would stay dirty forever and #2435's aged
+# worktree sweep (clean-only) could never reap it.
+.pi-lens-probe-home/
 .harness/
 .pi-subagents/
 
@@ -69,6 +75,11 @@ migrate-*.js
 !CONTRIBUTING.md
 !LICENSE
 !SECURITY.md
+!docs/pi-lens-subagent.md
+!docs/pi-lens-fixer.md
+!docs/pi-lens-reviewer.md
+!docs/pi-lens-investigator.md
+!docs/pi-lens-warden.md
 !docs/audit1.md
 !docs/agent-guide.md
 !docs/agent-tools.md
@@ -97,6 +108,8 @@ migrate-*.js
 !docs/analysisall.md
 !docs/api-ports-inventory.md
 !docs/astplayground.md
+!docs/public-api-stability.md
+!docs/configuration.md
 !skills/**/*.md
 !.github/PULL_REQUEST_TEMPLATE.md
 
@@ -146,6 +159,9 @@ clients/lsp/.intelephense/
 !.claude/skills/
 !.claude/skills/**
 !.claude/skills/**/*.md
+# Project-level hook registrations (#2435). settings.local.json stays ignored:
+# it is per-developer permission state, not shared configuration.
+!.claude/settings.json
 autoresearch.jsonl
 coverage/
 PR_issues_Audit.md

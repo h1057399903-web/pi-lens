@@ -18,7 +18,8 @@
 		"build:dist": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && npx --yes -p typescript@7.0.2 tsc --project tsconfig.dist.json --noCheck && npm run bundle:dist",
 		"bundle:dist": "node scripts/bundle-dist.mjs",
 		"prepare": "npm run build:dist && node scripts/download-grammars.js --core --dest grammars && node scripts/setup-git-hooks.mjs && node scripts/warm-loader-cache.mjs",
-		"lint": "tsc --project tsconfig.json",
+		"lint": "tsc --project tsconfig.json && npm run lint:js",
+		"lint:js": "oxlint --deny-warnings --ignore-pattern \"tests/**/*.ts\" --ignore-pattern \"tests/**/*.tsx\" --ignore-pattern \"**/*.d.mts\" --ignore-pattern \"tests/fixtures/autofix-smoke/**\" --ignore-pattern \"tests/fixtures/format-smoke/**\" --ignore-pattern \"tests/fixtures/tool-smoke/**\" --ignore-pattern \"tests/fixtures/call-graph/javascript/**\" --ignore-pattern \"tests/fixtures/function-facts/javascript-parameter.js\" .",
 		"depcruise:check": "depcruise --validate --config .dependency-cruiser.cjs --ignore-known .dependency-cruiser-known-violations.json --output-type err index.ts \"clients/**/*.ts\"",
 		"fmt": "oxfmt",
 		"fmt:check": "oxfmt --check",
@@ -26,7 +27,9 @@
 		"test": "node scripts/with-test-lock.mjs -- vitest run",
 		"test:unit": "node scripts/with-test-lock.mjs -- vitest run",
 		"test:integration": "node scripts/with-test-lock.mjs -- vitest run tests/index-integration.test.ts tests/clients/lsp/integration.test.ts",
+		"test:targeted": "node scripts/with-test-lock.mjs --shared -- vitest run",
 		"test:watch": "vitest",
+		"hygiene": "node scripts/prune-agent-worktrees.mjs",
 		"check": "node scripts/check-extensions.mjs",
 		"selftest:install": "node scripts/install-selftest.mjs",
 		"check:lockfile": "node scripts/check-lockfile-sync.mjs",
@@ -131,8 +134,8 @@
 		"dependency-cruiser": "^18.2.0",
 		"husky": "^9.1.7",
 		"json5": "^2.2.3",
-		"oxfmt": "0.64.0",
-		"oxlint": "1.79.0",
+		"oxfmt": "0.65.0",
+		"oxlint": "1.80.0",
 		"typebox": "^1.0.0",
 		"typescript": "^7.0.2",
 		"typescript-language-server": "^6.0.0",
@@ -159,7 +162,7 @@
 		]
 	},
 	"allowScripts": {
-		"@ast-grep/cli@0.45.1": true,
+		"@ast-grep/cli@0.45.2": true,
 		"@google/genai@1.52.0": true,
 		"protobufjs@7.6.5": true
 	}

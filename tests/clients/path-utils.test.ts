@@ -1,10 +1,28 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// Controllable `os.homedir()` override for the mutation-proof HOME-default
+// test below — `vi.spyOn(os, "homedir")` fails under Vitest's ESM
+// interop ("Cannot redefine property"), so the module itself is replaced
+// with a thin wrapper that defers to the REAL os.homedir() unless a test
+// has set an override (refs #2472 review round 3, F2). Never used to touch
+// the real HOME directory — only to redirect os.homedir() to a temp dir.
+const homedirOverride = vi.hoisted(() => ({
+	value: undefined as string | undefined,
+}));
+vi.mock("node:os", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:os")>();
+	const homedir = () => homedirOverride.value ?? actual.homedir();
+	return { ...actual, default: { ...actual, homedir }, homedir };
+});
+
 import {
 	findLocalToolConfig,
 	findNearestContaining,
 	findNearestMarkerRoot,
+	homeRelativePath,
 	isFullyQualified,
 	isFullyQualifiedPosix,
 	isFullyQualifiedWin32,
@@ -392,6 +410,86 @@ describe("findLocalToolConfig (refs #680)", () => {
 		]);
 		expect(found).toBeUndefined();
 	});
+
+	// #2472 review round 3, F1 (maintainer-decision reversal): the $HOME
+	// ceiling is now OPT-IN via `options.homeDir`, not default-on — an
+	// EXPLICIT `homeDir` still stops the climb even when a config sits one
+	// level above it (the ceiling itself still works; only its default
+	// posture changed).
+	it("stops the ancestor climb at options.homeDir when a config sits one level above it, but only when homeDir is passed", () => {
+		const env = setupTestEnvironment("pi-lens-find-tool-config-homeceiling-");
+		try {
+			fs.writeFileSync(path.join(env.tmpDir, "typos.toml"), "");
+			const homeDir = path.join(env.tmpDir, "home");
+			const startDir = path.join(homeDir, "project", "src");
+			fs.mkdirSync(startDir, { recursive: true });
+
+			const found = findLocalToolConfig(startDir, ["typos.toml"], {
+				homeDir,
+			});
+			expect(found).toBeUndefined();
+
+			// Cross-form (forward-slash) startDir must be guarded identically.
+			const crossFormStartDir = startDir.split(path.sep).join("/");
+			expect(
+				findLocalToolConfig(crossFormStartDir, ["typos.toml"], { homeDir }),
+			).toBeUndefined();
+
+			// Without an explicit homeDir the SAME search is unceilinged and
+			// finds the ancestor config — proves the ceiling in the assertions
+			// above comes from opting in, not from some other accident of this
+			// fixture (e.g. depth or directory naming).
+			expect(findLocalToolConfig(startDir, ["typos.toml"])).toBe(
+				path.join(env.tmpDir, "typos.toml"),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #2472 review round 3, F2: the prior version of this test
+	// ("is at-or-above os.homedir() by default when options is omitted") was
+	// vacuous — it searched for a fabricated filename that exists nowhere on
+	// disk, so `found` was `undefined` regardless of whether the ceiling ran
+	// at all; a fold that deleted the ceiling check entirely left this test
+	// green. Replaced with a non-vacuous, mutation-proof pair: a REAL config
+	// file sitting exactly AT a mocked `os.homedir()` (never the real HOME —
+	// writing fixture files into the operator's actual home directory is the
+	// #2506 class) must resolve when `options` is omitted (default OFF, no
+	// ceiling — refs #2472 review round 3 F1) and must NOT resolve once an
+	// explicit `{ homeDir }` opts back into the ceiling (`isAtOrAboveHomeDir`'s
+	// own `dir === homeDir` branch fires before any name in that directory is
+	// even checked).
+	it("resolves a config AT a mocked HOME by default, but not once { homeDir } opts into the ceiling", () => {
+		const env = setupTestEnvironment("pi-lens-find-tool-config-mockedhome-");
+		try {
+			const mockedHome = path.join(env.tmpDir, "mocked-home");
+			fs.mkdirSync(mockedHome, { recursive: true });
+			homedirOverride.value = mockedHome;
+			const configName = "this-config-lives-at-mocked-home-XYZZY.toml";
+			fs.writeFileSync(path.join(mockedHome, configName), "");
+
+			try {
+				// Options omitted: no ceiling, so the walk finds the config
+				// sitting exactly at the (mocked) home directory itself.
+				expect(findLocalToolConfig(os.homedir(), [configName])).toBe(
+					path.join(mockedHome, configName),
+				);
+
+				// Explicit opt-in with the SAME directory: the ceiling now blocks
+				// it, proving the two calls differ ONLY by the opt-in.
+				expect(
+					findLocalToolConfig(os.homedir(), [configName], {
+						homeDir: os.homedir(),
+					}),
+				).toBeUndefined();
+			} finally {
+				homedirOverride.value = undefined;
+			}
+		} finally {
+			env.cleanup();
+		}
+	});
 });
 
 describe("findNearestMarkerRoot (refs #625)", () => {
@@ -688,5 +786,47 @@ describe("normalizeLoggedPath (#2219, #2229 review round 1)", () => {
 	it("pins current behavior for a drive-rooted command WITH arguments (no live caller does this)", () => {
 		const withArgs = String.raw`C:\tools\rg.exe --files`;
 		expect(normalizeLoggedPath(withArgs)).toBe(normalizeFilePath(withArgs));
+	});
+});
+
+describe("homeRelativePath (#2440 F5)", () => {
+	const home = os.homedir();
+
+	it("rewrites a $HOME-anchored path to its ~ form", () => {
+		expect(homeRelativePath(path.join(home, ".pi-lens", "config.json"))).toBe(
+			"~/.pi-lens/config.json",
+		);
+	});
+
+	it("returns a bare ~ for the home directory itself", () => {
+		expect(homeRelativePath(home)).toBe("~");
+	});
+
+	it("leaves a path outside home untouched, separators included", () => {
+		const outside = path.join(path.sep, "etc", "pi-lens.json");
+		expect(homeRelativePath(outside)).toBe(outside);
+		expect(homeRelativePath("relative/a.ts")).toBe("relative/a.ts");
+		expect(homeRelativePath("")).toBe("");
+	});
+
+	it("does not rewrite a SIBLING whose name merely starts with home's", () => {
+		// `/home/jane-backup` is not under `/home/jane`. A prefix test without
+		// the separator would have claimed it.
+		expect(homeRelativePath(`${home}-backup/config.json`)).toBe(
+			`${home}-backup/config.json`,
+		);
+	});
+
+	it("takes the home directory as an argument, so no assertion depends on the box", () => {
+		expect(
+			homeRelativePath("/home/jane/.pi-lens/config.json", "/home/jane"),
+		).toBe("~/.pi-lens/config.json");
+		// A trailing separator on home must not produce `~//...`.
+		expect(homeRelativePath("/home/jane/a.json", "/home/jane/")).toBe(
+			"~/a.json",
+		);
+		expect(homeRelativePath("/home/janet/a.json", "/home/jane")).toBe(
+			"/home/janet/a.json",
+		);
 	});
 });

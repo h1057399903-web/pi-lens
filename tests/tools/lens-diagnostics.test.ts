@@ -295,6 +295,7 @@ describe("lens_diagnostics mode=delta", () => {
 			blocking: 1,
 			errors: 1,
 			warnings: 1,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{ severity: "error", message: "boom", line: 5 },
@@ -655,7 +656,12 @@ type Diag = Summary["diagnostics"][number];
 
 function sum(
 	filePath: string,
-	counts: { blocking?: number; errors?: number; warnings?: number },
+	counts: {
+		blocking?: number;
+		errors?: number;
+		warnings?: number;
+		advisories?: number;
+	},
 	opts: { hasFinalSnapshot?: boolean; diagnostics?: Diag[] } = {},
 ): Summary {
 	return {
@@ -663,6 +669,7 @@ function sum(
 		blocking: counts.blocking ?? 0,
 		errors: counts.errors ?? 0,
 		warnings: counts.warnings ?? 0,
+		advisories: counts.advisories ?? 0,
 		hasFinalSnapshot: opts.hasFinalSnapshot ?? true,
 		diagnostics: opts.diagnostics ?? [],
 	};
@@ -2666,6 +2673,59 @@ describe("lens_diagnostics mode=all", () => {
 		});
 	});
 
+	// #2414: hint/info tier findings are style opinions and must not present
+	// as warning defects. `advisories` is a separate tally that keeps a
+	// hint-only file visible without inflating `warnings`.
+	describe("severity projection (#2414)", () => {
+		it("a hint/info-only file is excluded from severity=warning", async () => {
+			mockSummaries.length = 0;
+			mockSummaries.push(sum("/proj/hints.ts", { advisories: 2 }));
+			mockSummaries.push(sum("/proj/real-warning.ts", { warnings: 1 }));
+			const result = await run(makeTool(), {
+				mode: "all",
+				severity: "warning",
+			});
+			const text = String(result.content[0].text);
+			expect(text).toContain("real-warning.ts");
+			expect(text).not.toContain("hints.ts");
+		});
+
+		it("a hint/info-only file still surfaces under severity=all (not dropped)", async () => {
+			mockSummaries.length = 0;
+			mockSummaries.push(sum("/proj/hints.ts", { advisories: 2 }));
+			const result = await run(makeTool(), { mode: "all", severity: "all" });
+			const text = String(result.content[0].text);
+			expect(text).toContain("hints.ts");
+			expect(text).toContain("2 hints");
+			expect(result.details).toMatchObject({ filesWithIssues: 1 });
+		});
+
+		it("summary totals separate advisories from warnings", async () => {
+			mockSummaries.length = 0;
+			mockSummaries.push(sum("/proj/a.ts", { warnings: 3, advisories: 5 }));
+			const result = await run(makeTool(), { mode: "all" });
+			const text = String(result.content[0].text);
+			expect(text).toContain("3 warnings");
+			expect(text).toContain("5 hint/info");
+			expect(result.details).toMatchObject({
+				totalWarnings: 3,
+				totalAdvisories: 5,
+			});
+		});
+
+		it("a hint/info-only session renders as clean, not as N warnings", async () => {
+			mockSummaries.length = 0;
+			mockSummaries.push(sum("/proj/hints.ts", { advisories: 4 }));
+			const result = await run(makeTool(), { mode: "all" });
+			expect(result.details).toMatchObject({
+				totalBlocking: 0,
+				totalErrors: 0,
+				totalWarnings: 0,
+				totalAdvisories: 4,
+			});
+		});
+	});
+
 	// #1799: `semantic === "blocking"` iff `severity === "error"` holds
 	// codebase-wide, so every error-severity finding is ALSO a blocking one —
 	// the rendered summary must not print the same 3 findings once as
@@ -3410,6 +3470,7 @@ describe("lens_diagnostics disposition read-filter (#755)", () => {
 			blocking: 0,
 			errors: 0,
 			warnings: 1,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{
@@ -3540,6 +3601,7 @@ describe("lens_diagnostics disposition read-filter (#755)", () => {
 			blocking: 0,
 			errors: 0,
 			warnings: 1,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{
@@ -3655,6 +3717,7 @@ describe("lens_diagnostics disposition read-filter (#755)", () => {
 			blocking: 0,
 			errors: 0,
 			warnings: 1,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{
@@ -3691,6 +3754,7 @@ describe("lens_diagnostics disposition read-filter (#755)", () => {
 			blocking: 0,
 			errors: 0,
 			warnings: 1,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{
@@ -3810,5 +3874,100 @@ describe("lens_diagnostics counts hint-tier findings (#1777)", () => {
 			severity: "error",
 		});
 		expect(String(result.content[0].text)).toContain("No error issues across");
+	});
+});
+
+/**
+ * #2504 review round 5 (F3) — the MULTI-STAMP arm of applyDeltaFreshnessGate.
+ *
+ * Round 4 taught the gate to age each entry by its own `generatedAt`, because
+ * a merged actionable-warnings report can carry entries observed minutes
+ * apart. That ~35-line branch shipped with NO test: reverting it to a single
+ * report-level stamp left the whole suite green. This is the case that fails
+ * under that revert.
+ *
+ * Both files were last written FIVE minutes ago. The report-level stamp, and
+ * the newer entry's, are one minute old — so the newer half is live. The
+ * older entry was observed TEN minutes ago, before the edit, so its cited line
+ * cannot be trusted and it must be demoted. Judged against the report-level
+ * stamp alone, both would read live and the older half's stale line number
+ * would be served to the model as current.
+ */
+describe("lens_diagnostics mode=delta — per-entry freshness on a merged report (#2504 r5 F3)", () => {
+	it("demotes the entry observed before the edit and keeps the one observed after", async () => {
+		const cwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-2504-r5-merged-"),
+		);
+		try {
+			const olderFile = path.join(cwd, "src", "older.ts");
+			const newerFile = path.join(cwd, "src", "newer.ts");
+			fs.mkdirSync(path.dirname(olderFile), { recursive: true });
+			fs.writeFileSync(olderFile, "export const a = 1;\n");
+			fs.writeFileSync(newerFile, "export const b = 2;\n");
+			const editedAt = new Date(Date.now() - 5 * 60_000);
+			fs.utimesSync(olderFile, editedAt, editedAt);
+			fs.utimesSync(newerFile, editedAt, editedAt);
+
+			const reportStamp = new Date(Date.now() - 60_000).toISOString();
+			const tool = makeTool({
+				"actionable-warnings": {
+					// The report-level stamp is the NEWER half's; it is only the
+					// fallback for an entry that carries none of its own.
+					generatedAt: reportStamp,
+					files: [
+						{
+							filePath: olderFile,
+							displayPath: "src/older.ts",
+							generatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+							warnings: [
+								{
+									line: 11,
+									rule: "r-old",
+									tool: "typescript",
+									message: "observed before the edit",
+								},
+							],
+						},
+						{
+							filePath: newerFile,
+							displayPath: "src/newer.ts",
+							generatedAt: reportStamp,
+							warnings: [
+								{
+									line: 22,
+									rule: "r-new",
+									tool: "typescript",
+									message: "observed after the edit",
+								},
+							],
+						},
+					],
+					summary: { warnings: 2 },
+				},
+			});
+
+			const result = await run(tool, { mode: "delta" }, cwd);
+			const rows = String(result.content[0].text).split("\n");
+			const oldRow = rows.find((line) =>
+				line.includes("observed before the edit"),
+			);
+			const newRow = rows.find((line) =>
+				line.includes("observed after the edit"),
+			);
+			expect(oldRow).toBeDefined();
+			expect(newRow).toBeDefined();
+			// Demoted: it loses its coordinate, keeps its rule and message.
+			expect(oldRow).toContain("stale — re-run to confirm");
+			expect(oldRow).not.toContain("L11");
+			expect(oldRow).toContain("r-old");
+			// Untouched: the newer observation postdates the edit.
+			expect(newRow).toContain("L22");
+			expect(newRow).not.toContain("stale");
+			// Both files still present — the older half is demoted, not dropped.
+			expect(rows.some((line) => line.includes("older.ts"))).toBe(true);
+			expect(rows.some((line) => line.includes("newer.ts"))).toBe(true);
+		} finally {
+			removeTempDirSync(cwd);
+		}
 	});
 });

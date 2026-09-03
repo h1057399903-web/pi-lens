@@ -22,6 +22,10 @@ import { recordRunner } from "../widget-state.js";
 import { incrementDegradationCount } from "../degradation-ledger.js";
 import { detectFileKind } from "../file-kinds.js";
 import { detectFileRole } from "../file-role.js";
+import {
+	classifyGeneratedOrArtifactDetailed,
+	type GeneratedArtifactEvidence,
+} from "../generated-artifacts.js";
 import { isTestFile } from "../file-utils.js";
 import { getPrimaryDispatchGroup } from "../language-policy.js";
 import { resolveLanguageRootForFile } from "../language-profile.js";
@@ -96,7 +100,7 @@ export class RunnerRegistry implements RunnerRegistryContract {
 
 		for (const runner of this.runners.values()) {
 			if (isTest && runner.skipTestFiles) continue;
-			if (runner.appliesTo.includes(kind) || runner.appliesTo.length === 0) {
+			if (runnerAppliesToKind(runner, kind)) {
 				matching.push(runner);
 			}
 		}
@@ -111,6 +115,16 @@ export class RunnerRegistry implements RunnerRegistryContract {
 	clear(): void {
 		this.runners.clear();
 	}
+}
+
+function runnerAppliesToKind(
+	runner: RunnerDefinition,
+	kind: FileKind | undefined,
+): boolean {
+	return (
+		runner.appliesTo.length === 0 ||
+		(kind !== undefined && runner.appliesTo.includes(kind))
+	);
 }
 
 // --- Tool Availability Cache ---
@@ -312,10 +326,20 @@ export function createDispatchContext(
 	);
 	const normalizedFilePath = normalizeMapKey(absoluteFilePath);
 	const kind = detectFileKind(normalizedFilePath);
-	const fileRole = detectFileRole(
-		normalizedFilePath,
-		readFilePrefix(normalizedFilePath),
-	);
+	const contentPrefix = readFilePrefix(normalizedFilePath);
+	const fileRole = detectFileRole(normalizedFilePath, contentPrefix);
+	// Captured once here so the generated short-circuit below can emit a
+	// `dispatch_skipped_generated` record carrying the deciding evidence tier
+	// and the measured line-shape statistic — without re-reading the file
+	// (refs #2346). The content passed is the same 4096-byte prefix already
+	// read for role detection, so this classification costs no extra I/O.
+	const generatedDetail =
+		fileRole === "generated"
+			? classifyGeneratedOrArtifactDetailed(normalizedFilePath, {
+					content: contentPrefix,
+					includeDeclarations: false,
+				})
+			: undefined;
 	const projectConfig = loadPiLensProjectConfig(normalizedCwd);
 
 	return {
@@ -324,6 +348,8 @@ export function createDispatchContext(
 		cwd: normalizedCwd,
 		kind,
 		fileRole,
+		generatedEvidence: generatedDetail?.evidence,
+		generatedLineShapeMean: generatedDetail?.lineShapeMean,
 		pi,
 		autofix: false,
 		deltaMode: !pi.getFlag("no-delta"),
@@ -510,10 +536,10 @@ function promoteDeltaUnusedToBlockers(diagnostics: Diagnostic[]): Diagnostic[] {
  * Optional per-runner result sink. Fires once for each runner that actually
  * executes (immediately after its `run()` returns), with the exact
  * `RunnerResult` — including `failureKind`/`failureMessage` that the merged
- * `DispatchResult` discards. Runners that are filtered out, `when`-skipped, or
- * not registered do not fire it. Lets the live tool-smoke harness (#209) assert
- * each tool spawned and exited cleanly without duplicating dispatch's
- * selection/gating logic.
+ * `DispatchResult` discards. Runners that are filtered out, `when`-skipped,
+ * skipped for being a test file, or not registered do not fire it. Lets the
+ * live tool-smoke harness (#209) assert each tool spawned and exited cleanly
+ * without duplicating dispatch's selection/gating logic.
  */
 export type RunnerResultSink = (runnerId: string, result: RunnerResult) => void;
 
@@ -522,7 +548,13 @@ export interface RunnerLatency {
 	startTime: number;
 	endTime: number;
 	durationMs: number;
-	status: "succeeded" | "failed" | "skipped" | "when_skipped" | "pending";
+	status:
+		| "succeeded"
+		| "failed"
+		| "skipped"
+		| "when_skipped"
+		| "test_file_skipped"
+		| "pending";
 	diagnosticCount: number;
 	semantic: string;
 	skipReason?: RunnerSkipReason;
@@ -601,7 +633,10 @@ function buildCoverageNotice(
 	if (primaryHasCoverage) return undefined;
 
 	const allPrimarySkipped = relevant.every(
-		(r) => r.status === "skipped" || r.status === "when_skipped",
+		(r) =>
+			r.status === "skipped" ||
+			r.status === "when_skipped" ||
+			r.status === "test_file_skipped",
 	);
 	if (!allPrimarySkipped) return undefined;
 
@@ -651,6 +686,11 @@ function buildCoverageNotice(
 
 const latencyReports: DispatchLatencyReport[] = [];
 const coverageNoticeSeen = new Set<string>();
+// One `dispatch_skipped_generated` phase record per file per process (refs
+// #2346): a generated file dispatched repeatedly must not spam latency.log,
+// so only the first skip of each file emits the row; the degradation ledger
+// below still tallies every repetition with a bounded per-subject count.
+const generatedSkipRecorded = new Set<string>();
 
 export function getLatencyReports(): DispatchLatencyReport[] {
 	return [...latencyReports];
@@ -662,6 +702,7 @@ export function clearLatencyReports(): void {
 
 export function clearCoverageNoticeState(): void {
 	coverageNoticeSeen.clear();
+	generatedSkipRecorded.clear();
 }
 
 export function formatLatencyReport(report: DispatchLatencyReport): string {
@@ -776,6 +817,61 @@ async function runGroup(
 				status: "not_registered",
 				diagnosticCount: 0,
 				semantic: "unknown",
+			});
+			continue;
+		}
+
+		// Same skipTestFiles gate RunnerRegistry.getForKind applies for the
+		// per-edit path (#2337): the plan/group path resolves runners by id via
+		// registry.get() instead, which bypasses getForKind entirely, so a
+		// runner declaring skipTestFiles never had it enforced here.
+		if (runner.skipTestFiles && isTestFile(ctx.filePath)) {
+			latencies.push({
+				runnerId,
+				startTime: runnerStart,
+				endTime: Date.now(),
+				durationMs: Date.now() - runnerStart,
+				status: "test_file_skipped",
+				diagnosticCount: 0,
+				semantic: "none",
+			});
+			logLatency({
+				type: "runner",
+				filePath: ctx.filePath,
+				runnerId,
+				durationMs: 0,
+				status: "test_file_skipped",
+				diagnosticCount: 0,
+				semantic: "none",
+			});
+			continue;
+		}
+
+		// Keep explicit groups aligned with RunnerRegistry.getForKind(): an empty
+		// appliesTo list means every kind, while a populated list must contain the
+		// current kind. A filtered runner remains visible as skipped telemetry so
+		// language mismatches cannot be mistaken for runner failures.
+		const appliesToCurrentKind = runnerAppliesToKind(runner, ctx.kind);
+		if (!appliesToCurrentKind) {
+			const runnerEnd = Date.now();
+			latencies.push({
+				runnerId,
+				startTime: runnerStart,
+				endTime: runnerEnd,
+				durationMs: 0,
+				status: "skipped",
+				diagnosticCount: 0,
+				semantic: "unknown",
+			});
+			logLatency({
+				type: "runner",
+				filePath: ctx.filePath,
+				runnerId,
+				durationMs: 0,
+				status: "skipped",
+				diagnosticCount: 0,
+				semantic: "unknown",
+				metadata: { reason: "applies_to", kind: ctx.kind },
 			});
 			continue;
 		}
@@ -1021,6 +1117,32 @@ export async function dispatchForFile(
 ): Promise<DispatchResult> {
 	const _overallStart = Date.now();
 	if (ctx.fileRole === "generated") {
+		// The generated short-circuit (refs #2346): never ran before this fix
+		// for name-less machine-emitted files (a scraped/minified page has no
+		// `.min.js` pattern to catch it), so the classification now also has a
+		// content-shape tier. The skip is observable — one `dispatch_skipped_generated`
+		// phase record per file per process carrying the deciding evidence tier
+		// and the measured line-shape statistic. Deliberately NOT a degradation
+		// ledger entry: skipping a generated file is healthy behavior working
+		// as designed, and the ledger's bounded kind slots are reserved for
+		// genuine degradations (#2348 review F3 — the ledger precedent at the
+		// collect-later tier flip below records an actual capability loss).
+		const evidence: GeneratedArtifactEvidence | undefined =
+			ctx.generatedEvidence;
+		const lineShapeMean = ctx.generatedLineShapeMean;
+		if (!generatedSkipRecorded.has(ctx.filePath)) {
+			generatedSkipRecorded.add(ctx.filePath);
+			logLatency({
+				type: "phase",
+				filePath: ctx.filePath,
+				phase: "dispatch_skipped_generated",
+				durationMs: 0,
+				metadata: {
+					evidence: evidence ?? "unknown",
+					...(lineShapeMean !== undefined && { lineShapeMean }),
+				},
+			});
+		}
 		return {
 			diagnostics: [],
 			blockers: [],
@@ -1069,8 +1191,8 @@ export async function dispatchForFile(
 	// key stays self-consistent within a session.
 	const baselineRelKey = `session.baseline.${normalizeEphemeralMapKey(relativeKey)}`;
 	const previousBaseline = ctx.deltaMode
-		? (ctx.facts.getSessionFact<Diagnostic[]>(baselineAbsKey) ??
-			ctx.facts.getSessionFact<Diagnostic[]>(baselineRelKey))
+		? (ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineAbsKey) ??
+			ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineRelKey))
 		: undefined;
 	const baselineWarnings = previousBaseline?.filter(
 		(d) => d.semantic === "warning" || d.semantic === "none",
@@ -1159,8 +1281,8 @@ export async function dispatchForFile(
 
 	// Persist full current snapshot for next run (not delta-filtered subset).
 	if (ctx.deltaMode) {
-		ctx.facts.setSessionFact(baselineAbsKey, [...dedupedDiagnostics]);
-		ctx.facts.setSessionFact(baselineRelKey, [...dedupedDiagnostics]);
+		ctx.facts.setBoundedSessionFact(baselineAbsKey, [...dedupedDiagnostics]);
+		ctx.facts.setBoundedSessionFact(baselineRelKey, [...dedupedDiagnostics]);
 	}
 
 	// Categorize results

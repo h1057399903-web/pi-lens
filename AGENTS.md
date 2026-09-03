@@ -34,6 +34,10 @@ references rot and are evidence-only):
 - Review graph, snapshots, or word index: Standing invariants
   project-intelligence group; "Project intelligence and snapshots".
 - Git-guard work: Standing invariants git-guard group.
+- Delegated work: "Role contracts for delegated work" and
+  `docs/pi-lens-subagent.md`, plus the selected role contract.
+- Multi-PR orchestration: "Role contracts for delegated work" and
+  `docs/pi-lens-warden.md`.
 - ast-grep or tree-sitter rules: Standing invariants rules group; "ast-grep
   rules"; "Tree-sitter rules".
 - Opening a PR: the PR template headings; the prose contract, blast-radius,
@@ -71,6 +75,36 @@ collided appending to this file's tail in one night):
 
 Message-end stale attribution anchors the session id when a live ctx is handled, not when the stale event drains: replacement can make the active id point at the wrong session. The anchor resets from `handleSessionStart` and is covered by the session-state registry; stale rows use its last live value or `unknown`. Durable degradation metadata truncates every value and retains only a bounded caller-key prefix, reporting dropped keys while reserved row fields win. (#1956 R2)
 
+- **Every new config key or env flag needs a demonstrated forcing function.** A
+  knob added "for flexibility" is public API the moment it ships (schema
+  stability policy #2418, written down in `docs/public-api-stability.md` and
+  held as data in `clients/config-diagnostic-codes.ts` — a published field
+  carries an `x-stability` tier, a user-facing config warning carries a stable
+  `PILENS_CFG_*` code, and a deprecated surface carries a
+  `deprecatedSince`/`removeNotBefore` window) and a permanent
+  test/doc/support obligation. Prefer
+  reserved-but-inert schema keys (documented, validated, unimplemented) over
+  premature implementation; prefer no knob at all over a reserved one when no
+  concrete consumer exists. Name the forcing function in the PR body.
+- **`clients/config-core/` is THE config seam.** Every loader, catalog, and
+  selector validates, merges, and explains its configuration through it (#2425)
+  — a fourth hand-written merge is a defect, not a design choice. It owns the
+  pipeline (`RawConfig` -> `validate(schema)` -> `NormalizedConfig` ->
+  `merge(sources)` -> `Resolved<T>`, with `resolveConfig` as the front door),
+  per-leaf provenance on the seven source tiers, monotonic deny precedence
+  (an operator-tier denial is never lifted; a repo-tier denial is lifted only by
+  a higher operator tier), per-node `x-merge-strategy`
+  (`replace`/`append`/`keyed:<field>`), the trust-gated `ProcessSpec` whose
+  `toSpawnArgs` refuses a `project`/`nested-project` command unless the spec's
+  recorded trust AND the host's live decision are both `trusted`, and bounded
+  redacted `MigrationRecord`s that reach the user only through
+  `warnIgnoredConfigOnce`. Schemas are plain JSON-Schema-shaped objects, so the
+  published artifact and the runtime validator are the same object. Semantics
+  are written down in `docs/public-api-stability.md` section 5. Migration
+  targets still on their own merge semantics: `clients/lsp/config.ts`
+  (`loadLSPConfig`), `clients/lens-config.ts` (`loadPiLensGlobalConfig`),
+  `clients/project-lens-config.ts` (`loadPiLensProjectConfig`) — #2426 adopts
+  them.
 - **Design the state space before coding.** For stateful, ordered, resource-mutating, or security-sensitive work, write the invariants, supported transitions, explicit deferrals, and a cross-product test matrix before implementation. Examples are not enough: cover operation order, preview/apply, validation/normalization/execution seams, failure atomicity, observability bounds, and OS/path/encoding axes. If adversarial review finds repeated cross-product defects, stop patching one symptom at a time and return to the model.
 - **Concurrency tests wait on the right clock.** Use `tests/clients/interleaving-kit.ts` for suspension and polling: every suspension belongs in `try/finally` with `release()` plus `restore()`, and waits on worker-thread or child-process progress must use the wall-time default. A custom tick yield is only valid for progress guaranteed to occur on the current event loop. Prefer a suspended call's `completed` promise over draining unrelated global work, and reset in-memory mirrors before asserting on durable disk state.
 - **Prove filesystem isolation before coding subagents touch Git.** A
@@ -103,6 +137,7 @@ Message-end stale attribution anchors the session id when a live ctx is handled,
   linked worktrees can corrupt it. Never copy `node_modules` into a worktree;
   copies drift immediately and resurrect stale compiled twins.
 - **Real-clock budget assertions run in the wall-clock-budget phase (#1920).** A test that asserts elapsed time around awaited work (a `Date.now()` delta, or a self-reported span whose window contains deschedulable real work) measures scheduler contention under the default project's fork storm, not code speed — startup-overhead measured 659-2321ms against a 500ms budget under load while passing solo every time. Such tests belong in vitest.config.ts's fully-serialized `wallClockBudgetInclude` list (dead-last quiet phase), NOT in the `timing-sensitive` project, whose charter is sampler-only. Before adding a new budget assertion, ask whether it can assert recorded/logical spans instead; if it must measure real time, add the file to the list and note the budget's origin. The existence check in `tests/config/timing-sensitive-coverage.test.ts` keeps renamed members from silently dropping out of every project.
+- **Real-LSP-spawn tests run in the lsp-spawn-heavy phase (#2344).** Tests that spawn a real LSP child and wait on its initialize handshake or first diagnostics belong in vitest.config.ts's serialized `lspSpawnHeavyInclude` lane (dead-last phase, `maxWorkers: 1`) — the #1022 ast-grep rule-compile and #2332/#2340 workspace-pull contention class. Membership is enforced, not conventional: `tests/config/lsp-spawn-heavy-coverage.test.ts` derives candidates from the spawn seams (a bare `launchLSP(` call, a `getServerById(` registry spawn, or an import of `tests/fixtures/fake-lsp-server.mjs`) and fails when a candidate is neither in the lane nor a documented exemption, and when a lane member goes stale. Add a new real-spawn test to the lane; a deliberate exception carries a named reason in that file's `SPAWN_EXEMPTIONS`.
 - **Fault-injection probes come from the kit, not ad hoc (#1838).** Wedged child pipes (`spawnWedgedChild`), deterministic seam delays (`delayInside`), starved env budgets (`starveBudget`), externally-resolvable gates (`gatedPromise`), and lifecycle hooks fired inside a mocked seam (`fireResetAt`) come from `tests/support/fault-injection.ts`. Indefinite suspension stays on `suspendAt`. When a fix touches a latch, teardown path, in-flight cache, or session-straddling write (catalog shapes 1/3/9/24), the red-first pass should reach for the matching primitive instead of hand-rolling a probe — the bespoke-fixture era produced each probe exactly once and then lost it. Each kit primitive carries its own fidelity test in `fault-injection.test.ts`; extending the kit means adding one, and a primitive whose fidelity test cannot detect its own neutering does not ship.
 - **Preserve the model in handoffs.** Every issue or PR should name the defect/capability class, separate in-scope acceptance criteria from explicit non-goals, state invariants and failure semantics, and enumerate relevant test dimensions. A PR must say which existing seams it extends, how it preserves those invariants, and which matrix cells it tests. Keep cross-cutting capabilities in separate PRs unless their composition is explicitly designed and tested.
 - **Adversarial-review every PR before merge.** For every non-trivial PR, run a read-only review against the actual final head after rebases/merges and CI. The reviewer must challenge the invariants, cross-product matrix, security boundaries, failure atomicity, observability bounds, and composition with merged changes—not merely repeat the happy-path tests. Request changes for real P1/P2 findings; after repeated cross-product findings, return to the state-space model instead of applying isolated patches. Do not merge on green CI alone. **Beware the skipped-CI-on-conflict trap:** a `DIRTY` (merge-conflicted) PR cannot have its merge-ref built, so `ci.yml`'s `Lint & type-check` and `Unit tests` jobs are **silently skipped, not failed** — the PR shows only the always-runnable checks (CodeQL/Sonar) green, and a naive `gh pr checks | grep -cv pass` reads zero because a skipped required check is absent, not failing. Resolving the conflict and pushing re-triggers `ci.yml`; before merging, verify the `Unit tests` job actually **ran and passed on the current head SHA** (e.g. `gh api repos/.../commits/<sha>/check-runs`), and never `--admin`-merge a formerly-DIRTY PR without that fresh green. **Conversely, SonarCloud is NOT a required check** — only `Lint & type-check` and `Unit tests` gate merge (confirm via `gh api repos/.../branches/master/protection/required_status_checks`); a red SonarCloud gate does NOT block merge and must not trigger correction rounds. Its `new_duplicated_lines_density` CPD over-flags inherently-repetitive code (lookup tables / policy maps — #1169's `FORMATTER_POLICY_BY_EXTENSION`), and its Automatic Analysis re-analyzes async so it **lags the head SHA** (a stale ERROR often clears once it catches up). Treat it as advisory: read the finding, don't contort correct code to satisfy CPD, and don't take a reviewer's assertion that "Sonar is a required gate" at face value — check the protection list (this cost two correction rounds on #1169). A `BLOCKED` merge-state with `Lint`+`Unit` green is usually just a non-required check (Sonar/install-matrix) pending — mergeable. **One review question the gates cannot ask (#1500):** when a call site hands a shared policy an outcome or classification it did not DERIVE from the evidence — `noteUnavailable("missing", "not-found")`, `available = false`, a hard-coded severity or verdict — ask what actually failed, and require either a derivation (`classifyProbeFailure`) or a comment justifying the assertion plus a record carrying the raw facts. Governed storage with a wrong classification looks identical to a correct verdict in the logs.
@@ -137,6 +172,61 @@ Message-end stale attribution anchors the session id when a live ctx is handled,
 ## Contributing
 
 For human contributors and issue/PR authors, see `CONTRIBUTING.md` at the repo root. It covers the development workflow, how to add runners, LSP servers, formatters, and rules, and the issue/PR templates. This `AGENTS.md` is the durable agent context; `CONTRIBUTING.md` is the public contributor guide.
+
+### Role contracts for delegated work
+
+Every delegated worker receives `docs/pi-lens-subagent.md` and exactly one role
+contract before it starts:
+
+- Use `docs/pi-lens-fixer.md` to implement an issue or requested change.
+- Use `docs/pi-lens-reviewer.md` to adversarially verify a finished change.
+- Use `docs/pi-lens-investigator.md` to root-cause behavior without editing.
+- Use `docs/pi-lens-warden.md` to audit PR state and route the next handoff.
+
+This routing applies to native subagents, Plegma workers, and any other agent
+runner. Include the contract text or an explicit repository-relative reference
+in the task. For Plegma, also pass the matching daemon contract names in this
+order: `pi-lens-subagent`, then the selected role. Repository instructions win
+if a daemon copy has drifted.
+
+Name the role, absolute worktree, branch, base, acceptance criteria, non-goals,
+and Git authority in every delegation. A role never grants Git authority by
+itself. Follow "Prove filesystem isolation before coding subagents touch Git":
+if the worker cannot verify a distinct registered worktree, it runs no Git
+commands, and the orchestrator owns commits, pushes, and PR operations.
+
+Do not manufacture busywork to occupy idle workers — an idle slot is cheaper
+than fake work. Delegate when a real producer, consumer, probe, or diagnosis
+is unresolved; never to keep an agent, worker pool, or task list looking busy.
+The same applies to ceremony aimed at the orchestrator itself: task-tracking
+and status artifacts exist for coordination that someone consumes, not as
+progress theater.
+
+Do not mix implementation and review in one delegation. If an investigation
+produces a fix, return the diagnosis and start a fixer delegation. If a reviewer
+finds a defect, return the finding and start a fixer round. Run the final review
+against the actual PR head in a separate reviewer delegation.
+
+For concurrent PR work, run the warden after every worker completion, push,
+review verdict, CI verdict, merge, and status request. The warden assigns each
+PR one workflow state, one next action, and one next owner from GitHub and
+registered-worktree evidence. Trigger that owner in the same orchestration
+pass. A completed handoff without a triggered next owner is an orchestration
+defect. Reuse the same fixer and reviewer across correction rounds. Enable
+automerge only after the final head passes required CI and same-reviewer
+verification. The warden remains read-only; Git and GitHub authority stays with
+the orchestrator.
+
+Record every worker handoff on the pull request or another shared ledger. Name
+the role, exact head or working-tree identity, verdict, finding dispositions,
+and next owner. A chat-only result is not durable workflow evidence and cannot
+support a later warden audit.
+
+All delegated roles follow `docs/pi-lens-subagent.md`'s "Tautological tests
+considered harmful" rule. A red-first test is valid only when it reaches the
+real seam, observes an independent result, and turns red when its guard or
+filter is removed. Treat setup-echoing assertions, duplicated predicates, and
+unnecessary in-process mocks as test defects.
 
 **The minimalism ladder — climb it before writing any code.** Be lazy about the solution, never about reading: understand the problem and trace the real code flow first, then ask, in order: (1) does this need to exist at all — would nothing break without it? (2) does this codebase already do it — reuse the existing seam (single-source-of-truth rule); (3) does the stdlib or platform do it? (4) does an installed dependency do it? (5) is it one line? Only then write the minimum that works. Lazy, not negligent: validation, error handling, security, bounded observability, and the degradation records this repo requires are never skipped for minimalism. The record: #2091 was built and then killed by measurement — step 1 asked before building would have saved the PR; #2106's catch-path outcome split was an unobservable discriminator that step 1 would have stopped ("a discriminator nothing can observe is a vacuous guard"). When a reviewer finds over-built code, the finding names the ladder step that was skipped.
 
@@ -180,6 +270,7 @@ This is the payoff of the two disciplines above: a bounded checklist of defect *
 	A completion signal must also cover loser cleanup: remove an in-flight request only after its owned stage/temp artifacts are synchronously reaped (or track the cleanup promise), so waiters cannot observe "done" while cleanup is still queued (#1318).
 	Teardown, breaker, and demotion paths cannot depend on the health of the resource they are tearing down. Bound every await on those paths, especially replies from a pipe already known to be dead, and put cleanup in `finally` (#1620).
 	Timer-owning cache entries clear their timer on the way OUT when a replacement is installed; clearing the incoming entry is vacuous and strands the outgoing payload behind its closure. Test replacement with a live-timer count, not elapsed time (#2073).
+	An entry registered into tracked state (map/set/registry) BEFORE a fallible or awaited step needs its removal proven on the failure path too — `finally`, or a settle handler that runs on every outcome; an unbounded store whose only removal lives on the success path is a leak with a delay. A bounded store (shape 9) caps the damage but is the backstop, not the fix.
 
 5. **A side-channel property dropped by spread / map / filter / `JSON`.** A flag or content-binding hung on an object is silently lost when the object is copied or serialized; the consumer reads `undefined` and mis-decides. *Screen:* read the signal off the ORIGINAL producer object, not a derived copy; if it must survive a copy, make it an enumerable field the copy carries. *e.g.* the diagnostics content-binding thread — #1095/#1104 (cascade fallback-display gated on binding read from the source, not the reconciled copy); #1094/#1096. *Detect:* trace whether the property survives every `{...x}`/`.map`/`JSON.parse(JSON.stringify(...))` between producer and consumer. Not ast-grep-able. **The corollary that broke the nightly (#1240):** when a seam's RETURN CONTRACT changes (the #1179 `touchFile` array→`TouchFileResult` wrapper), sweep the **un-type-checked consumers too** — `scripts/*.mjs` are outside the tsc surface, so the smoke script's `Array.isArray(touched)` reads survived the sweep and silently misread every wrapper as "no client ready" (43 skips + 5 aux fails, 7 green nights → red).
 
@@ -222,6 +313,9 @@ This is the payoff of the two disciplines above: a bounded checklist of defect *
 
 24. **A second writer added to a shared field without a discriminator.** The #1631/#1641 fix PRs' `WidgetDiagnostic.stale` collision combined demote-and-exclude with demote-but-keep-tally semantics; each fix was green alone, but the incompatibility surfaced only when their branches composed (#1633/#1703). *Screen:* when your change adds a second writer to an existing field: name every existing writer (grep the field's assignments); add a reason/kind discriminator with per-writer semantics BEFORE either lands; prove composition by running the other in-flight PR's test files on a locally merged tree — never by reasoning about different structures.
 25. **A process-uniqueness assumption held in module scope.** pi evaluates the pi-lens module graph MORE THAN ONCE per process — source and compiled entries load through separate graphs, in-process subagent binds re-enter the extension loader, and dogfood pass 3 measured one pid emitting `host_boot` nine times. Every module-scope `let` therefore exists N times, so any state whose correctness depends on being the process's only copy silently breaks, and a guard built on it becomes unreachable rather than wrong. The #2133 session-start guard was correct and never fired: evaluation 2 read an empty registration, classified a subagent temp root as `primary`, and ran the full battery (three identical word-index rebuilds, 240.8s of CPU for one index). The instance registry's single mutation tail became N tails and tore `instances.json` (#2146). *Screen:* when you add module-scope state, ask whether a SECOND copy of it in the same process would be merely wasteful or actually wrong. Registrations, serialization points, and once-per-process latches are wrong: put them behind `getProcessSingleton` (`clients/process-singletons.ts`) with a family version, and make the test-reset clear the GLOBAL state. Memos that re-derive the same answer from a stable source (an env read, a host probe) stay at module scope. *Detect:* a test that evaluates the module twice (`vi.resetModules()` + dynamic import) and asserts the second instance sees the first's state; `host_boot.metadata.evaluationOrdinal` in `latency.log` proves multi-evaluation in production.
+26. **A substitute surface still applying its old role's filter.** A component that stands in for another surface must deliver at the SUBSTITUTED surface's contract, not at the budget its former always-on role justified. `ast-grep-napi` became the ast-grep LSP's fallback in #239 Phase 2, but kept the per-edit `blockingOnly` floor from when it ran on every edit. That floor drops every rule whose declared severity is not `error` — 380 of the 481 bundled rules — while the LSP it replaces publishes all of them at their declared severity (`clients/dispatch/auxiliary-lsp.ts:179-183` states that contract in words). The gap was silent for the whole life of the seam: the runner reported zero diagnostics in all 255 retained dispatch records, so #2329's dedupe path had never once run with a finding in hand and looked correct because nothing could collide (#2336). *Screen:* when you gate a component behind "run only when X is unavailable", state X's output contract and check the component still meets it; a filter justified by the OLD role is a defect in the new one unless you re-argue it. Cost limits are re-argued against the substitute's value, not inherited: outside the substitute role the component is redundant, so its budget was never the binding constraint. *Detect:* for every fallback gate, diff the fallback's emitted set against the primary's on one fixture that violates a NON-blocking rule; a production-shaped test whose fixture only violates error-severity rules cannot see this class.
+
+27. **A caught error's own `message` — or a hand-authored string built from other user-controlled input — interpolated into a diagnostic sink without redaction.** A parser's error message is not the same trust level as a hand-authored string, even when both flow through the same `reason` parameter — `JSON.parse`'s `SyntaxError#message` is DOCUMENTED (V8) to embed a slice of the source text it was parsing, so a malformed USER-authored file (`.pi-lens.json`, `lsp.json`) that happens to carry a credential next to the syntax error leaks it verbatim into every sink the `reason` reaches — notification, log, ledger — the moment a caller does `error instanceof Error ? error.message : String(error)` and hands the result off as a plain string. The type signature gives no hint of the difference: `reason: string` accepts both a safe, validated message and a raw parser dump identically. "Hand-authored" is not the same as "content-free" either — a caller that interpolates a user-authored KEY or id read FROM the same file (`unknown key "${key}" is not a recognized setting`) hands the seam a string that is just as capable of embedding a credential as a raw parser message, even though no `Error` was ever caught; screening only the caught-error path and treating every string-typed `reason` as safe missed exactly this. *Screen:* when a caught error is turned into a diagnostic string, ask whether the THROWING code documents its message as potentially embedding input content (V8's JSON parser does; a hand-thrown validation error in this codebase does not) — a parser/engine error's message is never trusted verbatim, only its class and a position extracted by pattern. Discriminate that class by duck-typing (`error.name === "SyntaxError"`), not `instanceof`: a realm-crossing error (`vm.runInContext`, a worker, a different loaded copy of a dependency) fails `instanceof` against every constructor in the catching realm, `Error` included, and falls through to a "safe" branch that isn't. Every OTHER string reaching the sink — a caught error's message OR a hand-authored one — still routes through `clients/redact/secrets.ts`, but that scanner is a floor, not a guarantee: it only recognizes secrets shaped like its registered patterns, at least as long as each pattern's `minSuffixLength` (16-40 chars) — a short truncated fragment (V8 truncates its own JSON-parse snippet to a handful of characters) can clear the discriminator's "this is content, not a validated value" test and still slip past the scanner unrecognized. Normalize AND redact at the ONE seam every caller shares, not at each call site, so a caller cannot forget either half. *e.g.* #2431 (`clients/config-warn.ts`'s `normalizeParseErrorReason`; the three config loaders' `reason: error.message` all fed the seam a live snippet before the fix) and its round-2 follow-up (the same seam's hand-authored-string branch skipped `redactSecrets` entirely, so a KEY or rule id read from the file and interpolated into a validation message still leaked; and `instanceof SyntaxError` missed a realm-crossing error). *Detect:* grep `instanceof Error ? .*\.message` near a caught `JSON.parse`/`yaml`/`toml` parse of a file the loader reads from disk (not subprocess/tool output — that class is already the tool's own, not the user's authored config); ALSO grep the seam's hand-authored-string branch for whether it skips the scanner just because no `Error` was caught on that path; ask whether the sink is a notification/log/ledger a user or file can observe.
 
 For process singletons that own live child processes, an incompatible cell must
 call the owner's teardown seam before replacement and carry its pending handoff
@@ -244,6 +338,10 @@ A separate, narrower family from the shapes above: not a recurring bug, but a re
 **ast-grep candidates:** shapes 4, 2, 1, and 6 are *syntactically* detectable and could become dogfooded rules (assessed for false-positive load in **#1158**); shapes 3, 5, 7, 8, 10 are semantic — good and bad uses are syntactically identical — and stay review-enforced. Do not author rules here; #1158 tracks the viable set.
 
 **Anti-slop pattern adoption (2026-08-19, refs #1718).** A maintainer-supervised comparison against dmmulroy/anti-slop's 15 Oxlint rules (src/rules/, MIT-licensed; ported patterns credit the origin in each rule file's note) confirmed the six then-shipped rules above were already clean on this tree — `no-chained-type-assertions` 0 non-exempt hits (pre-strictness), `no-unknown-laundering`'s alias arm 0, `no-reflect-apply` 0, `no-reflect-get` 0 outside the documented 3-argument Proxy-trap exemption, `no-object-parameters` 0, and the `Record<string, any>` dictionary-value arm went from 2 confirmed hits (a wider sweep later found 2 more in test fixtures, fixed and exempted — see `no-unsafe-dictionary-any.yml`'s note) down to 0. That audit's follow-up shipped the remaining feasible patterns as new catalog rules: `no-unsafe-dictionary-any`/`no-unsafe-dictionary-unknown` (the `Record<K, V>` value-type arms, `error`/`hint`), `no-unknown-parameters`/`no-unknown-returns` (`hint` — the arms `no-unknown-laundering.yml` deliberately dropped for THIS repo's own FP load, now shipped for repositories without that finding), `no-known-value-widening` (`hint`, narrowed to the one syntactically self-contained sub-case ast-grep can check: an annotated `const x: Record<K, V> = { ... }` — upstream's full data-flow variable-resolution version is out of ast-grep's reach), and `require-safety-comment-for-as-unknown-as` (`hint`, scoped to `as unknown as` chains rather than every non-const assertion, unifying defect shape 13's ad-hoc "justify it in a comment" ask with a checkable rule). `no-runtime-typeof` shipped at `hint` with three structural exemptions (type-predicate-returning functions, functions named `parse`/`decode`/`validate`/`is`/`assert`, `.d.ts` files) after the original audit found the bare rule unworkable against this tree's 404 client-side hits. `no-widen-then-assert` was NOT ported: upstream's implementation resolves `const` variable references transitively across statements, which needs symbol-table data flow ast-grep's structural matcher doesn't have; a narrowed syntactic subset wasn't found. `no-module-mocking` and the Effect-specific rule stay out of scope per the original audit (test-hygiene ratchet design, and no Effect dependency, respectively). Every new/extended rule's per-file self-hit count against `clients/`+`tests/` is recorded in the adopting PR body, not chased to zero — hint-tier rules are shipped for the catalog's users, not as a mandate that pi-lens's own history retroactively conform in the same PR (#1718 owns that decision).
+
+**oxlint/ast-grep rule ownership (#1718, refs #2454/PR #2461).** Two shapes where a bundled ast-grep rule and an oxlint rule both touch `new Array(...)`/string-prefix-or-suffix checks — recorded here so the ownership question is answered once, not re-derived per PR:
+- `unicorn/no-new-array` (oxlint) only fires on the ambiguous *single-argument* `new Array(n)` call (length-vs-only-element). `no-array-constructor` (`rules/ast-grep-rules/rules/no-array-constructor.yml`, ast-grep, `warning`) fires on `new Array($$$ARGS)` for ANY arity and auto-fixes to `[$$$ARGS]` — strictly broader. `LINTER_OVERLAP` in `clients/dispatch/runners/ast-grep-napi.ts` is meant to suppress the ast-grep hint when a project's own linter already owns the shape, but it only checks `hasEslintConfig`, not `hasOxlintConfig` — so on pi-lens's own `.oxlintrc.json`-configured tree (and any other oxlint-only project) the two rules both report single-argument `new Array(n)` sites. Pre-existing gap, out of `lint:js`-scope PRs (it lives in the dispatcher, not `package.json`) — tracked by **#2462**.
+- `unicorn/prefer-string-starts-ends-with` (oxlint) and `prefer-string-starts-ends-with` (ast-grep, `rules/ast-grep-rules/rules/prefer-string-starts-ends-with.yml`) share a name but are DISJOINT: oxlint's targets a `^literal`/`literal$`-anchored regex test (`/^foo/.test(x)` → `x.startsWith("foo")`); ast-grep's targets `str.indexOf(sub) === 0`. Same name, no overlap, no `LINTER_OVERLAP` entry needed for this one.
 
 ## Standing maintenance routines (invoke on request)
 
@@ -272,11 +370,24 @@ turn-end delivery, and stale completed findings must re-arm a refreshed
 freshness baseline. Turn-end drains use a zero wait budget and requeue unsettled
 promises, so deferred work never adds a repeated per-turn stall (#2122).
 
+Post-agent test-runner delivery is activation/session-owned: the staged record
+retains its owning host, cache, runtime, and event context, while the quiet
+window receives the settled event's stable session identity and activation
+owner. A process-global latest activation must never select the pi/cache/runtime
+for another session's result. Persisted test-runner generations still gate
+delivery before append (#2366).
+
 Live contracts, grouped by subsystem. Consult the group for the seam you
 touch; each paragraph carries its evidence issue. New entries join their
 group (see the placement rules in "Maintaining this file").
 
 ### LSP: acquisition, touches, waits, and diagnostics
+
+Alternate language servers declare their preferred server through
+`LSPServerInfo.fallbackFor`. Primary acquisition and aggregate
+`clientScope: "all"` diagnostics preserve that order: an alternate starts only
+when its preferred server is unavailable. Complementary servers remain
+concurrent, and cross-cutting scanners use `role: "auxiliary"`. (#2400)
 
 The live LSP service, generation handoff, workspace-sweep hold state, and
 classic TypeScript repair latch use separate versioned families in
@@ -292,6 +403,12 @@ through `LSPClientState.notifyChangeQueues`; different paths remain parallel.
 `recordSentContent` rejects a lower-version mirror update and records an
 `lsp-document-send-order` degradation with the server and normalized path.
 (#2113)
+
+Document `didOpen` and `didChange` notifications share those per-client,
+per-path queues. A same-turn newer entry replaces only an unwritten pending
+entry; a transport write that has started always settles before the newer entry
+runs. Replacements retain the latest content and report their bounded count in
+the succeeding `lsp_document_send` metadata. (#2357)
 
 Auxiliary diagnostic waits preserve a warm-turn fast path: on a cold
 acquisition, the budget is `max(declared wait, observed spawn + 500ms)` clamped
@@ -409,6 +526,16 @@ bounded stuck-pair identity in the phase record. Pair-level retirements and
 finding-level counts use separate fields and reconcile each drained pair to
 one retirement or a pending-after count. (#2151)
 
+Notify-stall teardown is a temporary client-generation absence, not proof that
+an auxiliary scanner is gone. `LSPService` carries that reason through the
+read-only late-coverage probe with the demotion timestamp until a replacement
+generation is published; turn-end correlates each pair's mark to that timestamp
+before re-arming under the same TTL and count ceiling. Pairs marked after
+teardown follow ordinary `clientGone` handling. If no replacement appears
+before that bounded window closes, the pre-demotion pair is retired and
+re-raises `lsp_scanner_coverage_gap` with its server/file identity instead of
+being counted as an ordinary `clientGone` absence. (#2356)
+
 Every auxiliary touch emits one bounded `lsp_aux_wait_outcome` latency row, on
 both producers: the `with-auxiliary` grace wait (`waitShape: "aux_grace"`) and,
 since #1533, the `clientScope: "all"` aggregate wait (`waitShape: "aggregate"`),
@@ -439,8 +566,13 @@ scanner accepts each write in milliseconds, so every file still gets scanned,
 and only a scanner that cannot accept a write inside the budget makes a waiter
 give up. A write that lands after its deadline but inside the wedge window
 retracts the timeout it was charged for (slow is not broken); one nothing
-accepts for the whole wedge window keeps its strike and demotes the server, so
-the gate cannot defer a dead input path forever. A DEFERRED server is neither
+accepts for the whole wedge window keeps its strike and demotes the server (see
+the #2358 paragraph below for the CPU-liveness guard on that teardown), so
+the gate cannot defer a dead input path forever. Its queue wait uses the
+effective `primaryServerWaitFloorMs`, which includes the caller's
+`maxClientWaitMs` and any primary server `clientWaitTimeoutMs` override, so a
+cold primary's configured wait does not make the remaining queue budget appear
+to be already exhausted. A DEFERRED server is neither
 waited on nor read from — its version cannot advance, so waiting only burns its
 budget and would flip the touch to `inconclusive`, and its diagnostics cache
 still holds the previous content's findings because the resync that would have
@@ -451,7 +583,11 @@ silence reads as CLEAN unless the touch names it. A scanner that never attached
 `unconfirmedServerIds`, exactly like a cut-off or silent auxiliary, and the gap
 must reach the AGENT-facing surface too
 (`CascadeNeighborResult.unconfirmedServerIds` and the cascade formatter), not
-only the result wrapper. One `lsp_scanner_coverage_gap` row per touch records it.
+only the result wrapper. One aggregate `lsp_scanner_coverage_gap` count per
+touch records every pair; detailed re-raised rows use the bounded telemetry
+cap for the current turn, while the degradation ledger retains a bounded
+latest server/file identity window and its dropped count. The aggregate row
+reports dropped detail, so identities beyond those bounds are not implied.
 #1493's content-hash exemption outranks a deferral: a scanner whose STORED
 publication is bound to exactly these bytes has reported on this file, so the
 skipped resync withholds nothing — it stays covered, and its stored findings
@@ -460,6 +596,49 @@ and deferral open BEFORE any wait, so `auxiliaryCoverageGap` (which reads wait
 outcomes) cannot see them on the `clientScope: "all"` sweep path, which emits no
 outcome rows at all — they are unioned into `unconfirmedServerIds` separately.
 (#1459)
+
+**The notify-stall teardown tells dead from busy before it kills (#2358).** The
+wedge timer armed by `claimAuxNotifySlot` and the #743 streak ladder both call
+the same `demoteForNotifyStall`, and both now decide through the CPU-liveness
+discriminator. The wedged-write window is ADAPTIVE: max(fixed floor, k x EWMA
+per-write drain latency x unacked depth), capped at `notifyWedgedCapMs()`
+(default 60s). The EWMA (`auxNotifyDrainLatencyEwma`, `noteAuxNotifyDrainLatency`)
+is folded only from DRAINED notify barriers — a round-trip that proves the
+server processed its backlog — so a scanner that historically answers slowly
+earns patience instead of dying by construction. Past the window, the server's
+live process tree is sampled twice across `notifyStallCpuSampleMs()`
+(`notifyStallCpuVerdict` -> `sampleProcessTreeCpuPercent`, `clients/
+resource-sampler.ts`); a BUSY server is left alone and the timer re-arms, and
+only a flat or unmeasured one is torn down. The hard cap still kills a server
+whose CPU burns past its deadline: the replacement is the self-heal. The record
+`lsp_notify_backpressure_broken` names which discriminator fired
+(`budget-exceeded-cpu-flat`, `budget-exceeded`, or `cap-exceeded`) and carries
+the measured `budgetMs`, the `ewmaInputMs` input, the `unackedDepth`, and the
+`cpuVerdict`, so a production kill is classifiable from its own log line. A
+write that lands inside the adaptive window retracts the strike it was charged
+(the retraction ceiling matches the wedge window). The unacked ceiling stays
+pure backpressure; only the teardown decision gained discrimination. A busy
+defer emits the bounded `lsp_notify_stall_cpu_busy` record, one per re-arm
+cycle. Clients expose their live pid through the optional `getProcessPid`
+capability; a client without it (a test double, a legacy client) keeps the
+pre-#2358 demote-at-budget behavior. #2358's prerequisite is its own Windows
+fix: `clients/resource-sampler.ts` resolves `powershell.exe` through the shared
+`windowsExe` seam (System32) — the old path omitted `System32`, so every
+Windows CPU sample read as null and the discriminator was blind there.
+
+The notify-stall token is generation-owned: replacement, idle eviction, capacity
+eviction, and reset release its timer before state changes. Async decisions check
+the exact client object before sampling, after sampling, and before demotion or
+re-arm. Windows CPU history includes CIM `CreationDate`, so PID reuse starts a
+fresh rate window. A target missing from either sample or a failed query is
+`unmeasured`; missing descendants remain partial but valid evidence. Busy detail
+telemetry is rising-edge bounded per client/file identity, with repeat counts and
+dropped detail retained by the degradation ledger. The unmeasured verdict maps to
+the supported `budget-exceeded` discriminator, never to a fabricated flat result.
+Windows and POSIX samples validate finite, nonnegative RSS and CPU counters before
+they enter measured evidence; counter resets retire the baseline. Busy decision rows
+are excluded from `lastPhase` attribution because they describe an outcome, not host
+work. CPU identity history is capped at 4096 entries with oldest-entry eviction.
 
 **A touch's `inconclusive` verdict is PRIMARY-scoped; an auxiliary can only
 narrow it.** `resolveTouchVerdict` (`clients/lsp/diagnostic-binding.ts`) owns the
@@ -692,7 +871,13 @@ answers a same-cwd lookup from `detectionCache` before it reaches a probe, so
 dropping the latches without the selection cache leaves the previous session's
 verdict standing in the working directory. Formatter selection emits
 `formatter_selected` with `outcome: "hit" | "miss"` on both cache hits and
-re-detections so hit rate is computable from `latency.log`. (#1895, #1940)
+re-detections so hit rate is computable from `latency.log`. The first lookup for
+a cwd computes one session-generation config signature; warm extension lookups
+do no config polling. The write-result seam calls
+`invalidateFormatterCacheForPath` for config create, change, and remove events,
+which clears the signature and selection state together. External editor
+changes remain outside that seam and are rechecked at session reset. (#1895,
+#1940, #1603)
 
 Helm chart linting uses the shared workspace-topology `Chart.yaml` marker. YAML
 and `.tpl` edits inside a chart dispatch one canonical-root-deduplicated,
@@ -780,12 +965,75 @@ The LSP service follows it through `clients/lsp-lazy.ts` for async pipeline,
 session, and warm-attach consumers. The `index.ts` status/reset adapter remains
 eager because its synchronous shutdown/status contracts are host-visible; do
 not make those callbacks async without updating their ordering contract/tests.
+The seventeen analyzer clients follow it through `clients/bootstrap.ts` (#2467).
+Activation binds only the `SessionBootstrapAccess` seam; `handleSessionStart`
+receives that seam instead of constructed clients and its two client resets go
+through `peekBootstrapClients()`, which never starts a load — an unconstructed
+client has no session state to re-arm. `SessionStartDeps` carries the seam as ONE required field; a
+caller that already holds concrete clients (`clients/mcp/session.ts`, every
+test fixture) wraps them with `residentBootstrapAccess`. Do not reintroduce
+per-client fields beside the seam — the shape must not admit two answers.
+Demand goes through
+`requestBootstrapClients()`, which is bounded on BOTH axes (a wall-clock
+ceiling and an abort race) and fails OPEN: `null` means the caller
+proceeds without those analyzers, counted once per demand reason under the
+`analyzer-bootstrap-unavailable` ledger kind. The abort half is the seam's OWN
+session-teardown signal, folded in for every demand;
+`SessionBootstrapAccess.request` deliberately takes NO signal parameter,
+because session start is not turn-scoped work — a `session_start` landing
+mid-turn (sequential replacement, `/new`) arrives with the outgoing turn's
+ambient signal installed, and binding it cancelled every startup scan with no
+retry. Only genuinely turn-scoped callers (the `tool_call` complexity
+baseline) pass `getAmbientAbortSignal()`. `loadBootstrapClients()` stays
+the strict form for callers that cannot proceed without the clients. Concurrent
+demands share one `createSingleFlight` flight, a rejected load is retried by
+the next demand, and `markAnalyzerBootstrapShutdown()` (primary
+`session_shutdown`) refuses NEW loads without invalidating a waiter already in
+flight — nor a NEW demand through the STRICT accessor that joins a flight
+already running. `markAnalyzerBootstrapShutdown()` also aborts the seam's own
+teardown signal, which every BOUNDED demand races (#2467 review, F1); a
+`requestBootstrapClients()` call made AFTER shutdown therefore fails open
+immediately via that signal, whether or not a flight happens to still be
+running — the "still joins" guarantee is the strict accessor's alone.
+`resetAnalyzerBootstrapSessionState()` re-arms that gate at
+`session_start`. Retry is bounded: after `BOOTSTRAP_FAILURE_STRIKE_LIMIT` (3)
+consecutive failed builds the seam stops rebuilding and fails open
+immediately, recorded once under `analyzer-bootstrap-latched` and re-armed at
+`session_start` — a module that cannot resolve under the host's package
+layout fails identically every time, so re-running seventeen dynamic imports
+plus `collectInstallDiagnostics` per demand bought nothing. A `null` from
+`requestBootstrapClients()` is counted under `analyzer-bootstrap-unavailable`
+for every seam-caused reason (shutdown, timeout, a rejected load, the strike
+latch) but NOT for `aborted` — the caller's own signal firing is a deliberate
+cancel, not the seam degrading, and counting it would read as an unhealthy
+analyzer graph in `pilens_health` (#2467 review, F5).
+`bootstrap_clients_load` is emitted by `clients/bootstrap.ts`
+where the load actually runs, stamped with the attempt number, NOT by
+`handleSessionStart`.
+A demand must sit BELOW every guard that can answer without the clients:
+`handleToolCallImpl` asks `isComplexitySupportedFile`
+(`clients/tree-sitter-shared.ts`, projected from the canonical extension
+registry and the exported `COMPLEXITY_LANGUAGE_IDS` union that keys
+`LANGUAGE_NODES`) before demanding anything, so a Markdown/JSON/YAML/CSS read
+never loads the graph. Asking the CLIENT's `isSupportedFile` there would mean
+loading the graph to learn the answer is no — and since only a produced
+baseline memoizes the file, the load would repeat on every later read.
 
 **Multi-formatter extension policies resolve to one formatter (#1306):** explicit project configuration wins, and every policy with multiple candidates must name one unique `defaultFormatter` as its deterministic overlap tie-break. Kotlin Spotless selection is parsed from `build.gradle{.kts}` and `settings.gradle{.kts}` `spotless { kotlin { ... } }` blocks through `getSpotlessKotlinFormatter`; never add independent ktlint/ktfmt detection at a caller. Its small lexical pre-pass blanks comments and quoted strings before brace scanning (disabled `if (false)` blocks remain an explicit non-goal), and Gradle reads are memoized by path plus `mtimeMs` so repeated per-file selection does not repeat config I/O while mid-session edits invalidate naturally.
 
 **Truncation guards read the output-cap predicate before status handling (#2100).** `safeSpawnAsync` only sets `outputTruncated` when a call site passes `maxOutputBytes`. `truncatedByOutputCap` (`clients/spawn-output-cap.ts`) is the only guard for those incomplete bytes. It runs before failure or status handling and excludes timeout and abort, which own their classifications even when the output was capped. `stopForOutputLimit` separately records `killedForOutputCap` when it starts ending the child. POSIX commonly returns null status plus `SIGTERM`; Windows returns status 1 with no signal or failure. Callers that need to know whether pi-lens ended the process use `killedForOutputCap`, never either platform exit shape. This distinction matters to helm render: a cap-killed render leaves an unchecked prefix, while a completed render with truncated progress output still validates its output tree. A `maxOutputBytes` needs a rationale comment and a spawn-options cap test. Test POSIX and Windows cap-kill builders plus timeout and abort variants (`tests/support/spawn-shapes.ts`), anchored to a live cross-platform invariant in `safe-spawn-ambient-signal.test.ts`. The predicate stays dependency-free because shared runner tests mock `safe-spawn.js` directly. `classifyRunOutcome` uses output-cap evidence only to improve ledger wording, never to change outcome kind.
 
 **Markdownlint default-config invariant (#833):** the Markdown dispatch runner invokes `markdownlint-cli2` with the package-owned `config/markdownlint/core.json` when no project markdownlint config is found; that config disables MD013 and sets MD024 to `siblings_only` so intentional repeated category headings in changelogs are allowed while duplicate sibling headings remain violations. A project config is left to markdownlint-cli2 unchanged (no runner-level rule overrides). `hasMarkdownlintConfig` must recognize every config filename supported by the installed markdownlint-cli2, including the `.markdownlint-cli2.*` and `.markdownlint.{jsonc,json,yaml,yml,cjs,mjs}` families.
+
+**Biome bundled-config decorator-metadata invariant (#2385):** the bundled fallback `config/biome/core.jsonc` disables `style/useImportType`. The rule's safe fix rewrites a value import used only in type positions into `import type`, which erases the runtime binding that `experimentalDecorators` + `emitDecoratorMetadata` still need: verified against real Biome 2.5.9 plus tsc, the emitted `design:type` metadata changes from the imported class to `Function`, breaking decorator-based dependency injection. Biome's own rule docs recommend disabling the rule for such repos. An explicit project `biome.json(c)` remains authoritative: `biomeConfigArgs` passes no flag there, so a user-enabled `useImportType` still applies. Do not re-enable the rule in the bundled config without solving the metadata hazard; the lint and autofix surfaces both lose this one advisory, and no `skipReason` is added because nothing is skipped — the rule simply never fires. `tests/clients/biome-config-decorator-metadata.test.ts` drives the real pinned binary through `BiomeClient.fixFileAsync` and pins the preservation, the intact recommended ruleset, and the user-config authority; removing the override or the fallback flag turns it red. The sibling bundled fallbacks are not members of the hazard class: the ruff fallback selects no flake8-type-checking rules and `ruff-client.ts` never passes `--unsafe-fixes` (verified with real ruff on an annotation-only import), and the markdownlint fallback touches no runtime semantics.
+
+**Template-bearing extensions select no unconfigured formatter (#2384):** `FORMATTER_POLICY_BY_EXTENSION` sets `defaultWhenUnconfigured: false` for `.html`, `.htm`, `.yaml`, and `.yml` (the `.md`/#89 precedent). Real Prettier reinterprets template markers as code — an HTML `<script>{{JS}}</script>` embed became nested JavaScript blocks, and a Helm `{{ .Values.x }}` became `{ { .Values.x } }` (verified against prettier 3.3.3). A project `.prettierrc` or `package.json` `prettier` field opts in through the ordinary explicit-config branch; oxfmt's explicit-config path is unchanged. Do not restore a smart default for these extensions without solving marker preservation; a one-line fixture cannot prove safety because it hits `indentationArgs`/SKIP_FORMATTING before the tool runs.
+
+**`clients/cargo-manifest.ts` is the one Cargo.toml reader (#2466, folded #2473).** `extractTomlTableSection`/`parseTomlStringArray` (table-section slicing, string-array parsing) moved out of `clients/lsp/server.ts`'s rust-analyzer workspace-root hoisting (#1671/#1693), which now re-imports them instead of keeping a private copy — do not add a SECOND regex TOML reader; this one already covers table-section slicing, string-array/scalar parsing, and workspace-inheritance detection. `clients/review-graph/workspace-modules.ts`'s `scanCargoModules`/`detectWorkspaceType` (monorepo module-graph construction) used to carry an independent regex reader (`extractTomlArray`/`extractTomlSection`/`extractTomlString`) — a third copy, folded onto `readCargoWorkspaceMembers`/`readCargoDependencyNames`/`readCargoPackageName` (#2473). That fold also fixed a latent defect: the old `extractTomlString` was NOT table-scoped, so a member manifest whose `name` key appeared under an earlier non-`[package]` table (a `[[bin]] name = "..."` or `[package.metadata.*]` block preceding `[package]`) silently returned the wrong crate name for the module graph; `readCargoPackageName` is table-scoped like every other reader here. Review round 2 (#2473, PR #2480) hardened the fold: `extractTomlTableSection`/`parseTomlStringArray` now normalize CRLF→LF and strip `#`-to-EOL comments (quote-aware) before any regex runs — the pre-fold per-line reader did both and the fold's single multi-line-regex rewrite silently dropped the comment-strip pass, so a commented-out array entry (`# "member",`) stayed live; both the heading and its terminator are now anchored with `[ \t]*` rather than bare `^` so an indented (but valid) TOML heading is read, not silently treated as absent — and, since ECMAScript's multiline `$`/`^` already treat a bare `\r` as a line terminator, that SAME anchor change is also what made a CRLF manifest read correctly (review round 3 correction: the CRLF→LF normalize itself is defensive belt-and-braces, not a fix for a real match failure — verified by mutation, removing it leaves every test green). `readCargoWorkspaceMembers` gained `[workspace]` table-scoping and a sibling `readCargoWorkspaceExclude`, both now reused by `clients/lsp/server.ts`'s `cargoWorkspaceDeclaresMember` instead of that file hand-composing the same `extractTomlTableSection`+`parseTomlStringArray` pair itself — the same single-source-of-truth violation #2473 closed for the other two readers. `workspace-modules.ts`'s `detectWorkspaceType` also stopped using a bare `content.includes("[workspace]")` (true for a commented-out heading, wrongly short-circuiting past a real npm/pnpm workspace sitting next to it) in favor of a presence check on `extractTomlTableSection`. Review round 3 fixed a second sentinel-ambiguity defect in that same presence check: `extractTomlTableSection` used to return `""` for BOTH "table absent" and "table present but empty" (e.g. a bare `[workspace]` heading as the last line of the file with no trailing newline), so `!== ""` misread the second as the first — `detectWorkspaceType` and both `resolveCargoPackageEdition` "does this manifest declare `[workspace]`" checks now compare `!== undefined` instead, and `extractTomlTableSection`'s return type is `string | undefined`; `readCargoDependencyNames` also dropped a redundant, non-quote-aware `line.split("#", 1)[0]` re-strip left over from before the fold (its input is already comment-stripped by `normalizeToml`). `resolveCargoPackageEdition` walks up from a file via the shared `findNearestMarkerRoot`/`isAtOrAboveHomeDir` primitives (home-ceiling guarded, never a private walker) to the nearest `Cargo.toml`; reads `[package] edition` directly, or — when it declares `edition.workspace = true` — checks whether that SAME manifest is also the workspace root (`[package]`+`[workspace]`+`[workspace.package]` in one file, a common non-virtual-workspace-root shape) before climbing ancestors for the nearest one that DECLARES `[workspace]` (Cargo's own rule — not merely the nearest ancestor Cargo.toml, which may be an unrelated intermediate package) and reading ITS `[workspace.package] edition`. Every resolved value is checked against rustfmt's actual `--edition` enum (2015/2018/2021/2024, `SUPPORTED_RUSTFMT_EDITIONS`) — not a bare four-digit pattern, which would let a typo'd or too-new edition (e.g. `"2019"`) pass through and turn every `.rs` format into a hard failure; `rustfmtFormatter.resolveCommand` carries the validated value through `--edition` because bare `rustfmt <file>` (unlike `cargo fmt`) does not read the manifest's edition itself and silently rejects newer-edition syntax under its 2015 default. Manifest-value-into-argv sweep (#2466): ruff/black already self-discover `pyproject.toml`'s `target-version` from the file path they are given (no pi-lens translation needed); gofmt has no version-dependent flag at all; clang-format's own default is `-style=file` (ancestor `.clang-format` search) with no flag required; prettier/biome/ruff/shfmt already carry detected indentation through `indentationArgs` (#1144); psscriptanalyzer-format already carries `-Settings` (#1572 F2); ktlint self-discovers `.editorconfig` the same way (no carriage needed — its Spotless `build.gradle` detection is a tool-SELECTION axis, ktlint vs ktfmt, not an argv-carriage one). Two gaps found, tracked separately (not this fold's scope — see each issue for current status): **ktfmt** — its CLI did not read the `googleStyle()`/`kotlinLangStyle()` selection out of a project's `build.gradle{.kts}` ktfmt-gradle-plugin block (`hasKtfmtConfig`'s `KTFMT_GRADLE_FILES` check only detects ktfmt's PRESENCE, never which style it selects) and `ktfmtFormatter.resolveCommand` passed no style flag — fixed by #2468, see `clients/gradle-ktfmt-style.ts` below. **php-cs-fixer** — `detect()` walks up for `.php-cs-fixer(.dist).php` via `findNearestContaining`, but `resolveCommand` never passes `--config <path>` and `formatFile` spawns with `cwd` = the file's own directory, which php-cs-fixer does not walk up from on its own — fixed by #2472, see `clients/php-cs-fixer-config.ts` below.
+
+**`clients/gradle-ktfmt-style.ts` carries the Gradle `ktfmt { }` extension block's style selection into ktfmt's CLI argv (#2468).** ktfmt's own CLI never reads `build.gradle` — style is `--google-style`/`--kotlinlang-style`-flag-only (verified against ktfmt v0.63's `ParsedArgs.kt`, the version `clients/installer/index.ts` pins; the default is `--meta-style`, matching pi-lens's pre-fix bare invocation). `resolveKtfmtGradleStyle` walks up from the formatted file via the shared `findNearestMarkerRoot` (home-ceiling guarded, `homeDir`-injectable for tests, same primitive `resolveCargoPackageEdition` uses) to the nearest `build.gradle(.kts)`/`settings.gradle(.kts)`, and reuses `clients/tool-policy.ts`'s `stripGradleCommentsAndStrings`/`gradleBlockRanges` lexical pre-pass (exported for this reuse; `namedGradleBlockRanges`/`namedGradleBlockBodies` are now filters over `gradleBlockRanges`, so there is exactly ONE Gradle brace scanner) instead of a second hand-rolled Gradle parser — do not add a THIRD Gradle-block reader; extend this one or `getSpotlessKotlinFormatter`'s. **A gradle file is scoped, not just located (#2468 review rounds 2–3):** each `ktfmt { }` block is classified by the block that ENCLOSES it, read off the actual brace nesting of the stripped source via `gradleBlockRanges` (the labelled all-pairs scanner `namedGradleBlockRanges`/`namedGradleBlockBodies` now filter) — never a single hard-coded name test, which cannot tell an unrecognized wrapper from top level. The table is exact: no enclosing block → the DECLARING directory only; `subprojects { }` → descendants only, never the declaring one (so the root project's own sources get no flag from it — matching `./gradlew ktfmtFormat`); `allprojects { }` → both; **anything else** — `configure(subprojects.filter { … }) { }`, `project(":app") { }`, `tasks.register(…) { }`, a convention-plugin wrapper, or more than one nested block — → NEITHER, falling back to the bare invocation. Do not restore descendant inheritance for a TOP-LEVEL block: round 2 shipped it as a heuristic and it was wrong, because the plugin gives each project its OWN `KtfmtExtension` seeded with the plugin conventions (verified against `cortinico/ktfmt-gradle` `KtfmtExtension.kt` @`23bdedc8d5d641731a0cf128f1a386d5a127ce4e`), so a module applying the plugin with no style call formats under ktfmt's default — i.e. the bare invocation IS the correct carriage of `--meta-style` there, and the heuristic instead manufactured a NEW pi-lens/Gradle disagreement (pi-lens writes `--google-style`, `./gradlew ktfmtCheck` then rejects the file pi-lens just formatted) that the pre-#2468 code did not have. `hasKtfmtConfig`'s wider climb is NOT a justification for a wider style scope: election answers "is ktfmt the formatter for this file", style answers "which one", and the two questions have different correct scopes. The climb CONTINUES past a gradle directory that declares no style applying to the file being formatted, because the common multi-module layout puts the style in the root build file's `subprojects { }` while each module's own `build.gradle.kts` declares only its plugins; a nearer declaration still wins — the climb only continues when there is nothing to win with. Known gap (round 3, F3): hop 0 is TAKEN to be the owning project, so an `include(…)`-only module directory holding no build file of its own asks an ancestor for `own` scope where Gradle would apply `descendants`; closing it means reading `settings.gradle`'s `include(…)` list, which this module does not do. Against a root `subprojects { }` this is fail-safe — a missed flag, no flag at all — but against a root's own TOP-LEVEL style it is a WRONG flag: the module is handed the root's own style where Gradle applies none. `googleStyle()`/`kotlinLangStyle()` are plain setters over `blockIndent`/`continuationIndent`/`trailingCommaManagementStrategy` at that same SHA, so a body calling both resolves LAST-call-wins, and so does a later `ktfmt { }` block in the same file. `dropboxStyle()` — removed from the plugin in 0.19.0 (2024-07-03, "no longer supported by ktfmt") and never a ktfmt CLI flag at any version — is simply not a recognized style call: it takes the ordinary no-style path (it had a dedicated sentinel return in round 1 whose only effect was a debug log, and deleting that branch left every assertion green, so it is gone). `ktfmtFormatter.resolveCommand` carries the resolved flag ahead of the file path in argv (`[binary, "--google-style"|"--kotlinlang-style", filePath]`); any miss (no gradle file, no in-scope `ktfmt { }` block, or no recognized style call in one) falls back to the pre-#2468 bare command unchanged.
+
+**`clients/php-cs-fixer-config.ts` carries the nearest ancestor `.php-cs-fixer(.dist).php` into php-cs-fixer's own `--config` argv (#2472, corrected by review round 2 F3 and review round 3 F1/F3).** php-cs-fixer's `ConfigurationResolver` does NOT walk up parent directories looking for its config the way prettier/biome/eslint do — verified against `computeConfigFiles()` in `PHP-CS-Fixer/PHP-CS-Fixer` at tag `v3.64.0` (commit `58dd9c931c785a79739310aef5178928305ffa67`, `src/Console/ConfigurationResolver.php:548-588`). There is no `--path` OPTION on `fix` — `path` is a positional `InputArgument` — and the candidate directory is driven by that positional argument's dirname (`pathinfo($path[0], PATHINFO_DIRNAME)`), not by `$this->cwd`; cwd is only a SECOND, additional probe appended when it differs from the path's directory. Since every spawn passes the file as that positional argument, `$configDir` always resolves to the FILE's own directory regardless of the spawned process's cwd. Review round 3, F3: an earlier version of this note concluded from that quote that "spawn with `cwd` = the ancestor config's directory" is not a workable fix and that `--config` is "the only carriage" — that conclusion does NOT follow from the quoted code and is false: the `$configDir !== $this->cwd` branch appends `$this->cwd`-rooted candidates whenever the file's own directory differs from the spawn cwd (the common case), so setting the spawn `cwd` to the ancestor config's directory WOULD make `computeConfigFiles()` find it via that second branch. `--config <path>` remains the better fix — it names the exact winning file directly with no reliance on that inequality quirk — but it is not the ONLY possible one. `formatFile` spawns with `cwd` = the FILE's own directory, so an ancestor config found by `detect()`'s own climb (`hasPhpCsFixerConfig` in `clients/tool-policy.ts`) was invisible to the actual `fix` invocation whenever that ancestor directory was neither the file's own directory nor the spawn's cwd — php-cs-fixer silently fell back to its built-in default ruleset. `resolvePhpCsFixerConfig` walks up from the formatted file via the shared `findLocalToolConfig` (`clients/path-utils.ts`, refs #680 — the same "walk up for one of these config filenames" primitive `opengrep-config.ts`/`sgconfig.ts`/`typos-config.ts`/`zizmor-config.ts` already used, folded onto this resolver too instead of the private `findNearestMarkerRoot` call it started with). Review round 3, F1 (a maintainer-decision reversal): `findLocalToolConfig`'s `$HOME` ceiling is now OPT-IN (`options.homeDir`), default OFF, for all five callers — a round-2 fold had made it DEFAULT-ON, which broke every one of these tools' actual discovery contract, since each treats a config living directly at `$HOME` (`~/typos.toml`, `~/sgconfig.yml`, …) as the user's legitimate global config. For php-cs-fixer specifically, a ceilinged carriage also disagreed with its own UNCEILINGED detection gates (`hasPhpCsFixerConfig` via `findNearestContaining`, `phpCsFixerFormatter.detect` via its own `findUp`) — "config exists" from the gate, "config not found" from the resolver — silently dropping `--config` and re-creating #2472 for any project rooted at or above `$HOME`. Same-directory precedence mirrors `computeConfigFiles()`'s own candidate order: `.php-cs-fixer.php` wins over `.php-cs-fixer.dist.php` (first match in its array wins); the two legacy v2 names (`.php_cs`/`.php_cs.dist`) are not pi-lens's detection targets so are not candidates here either. `phpCsFixerFormatter.resolveCommand` now always resolves the binary explicitly (vendor/bin first, then global `which`) instead of ever falling through to the static `command` — that static array can never carry `--config` — so `--config` is attached whenever a config resolves, even when it sits in the file's own directory (not only the nested case the pre-#2472 gap actually missed); when neither probe finds a binary, `resolveCommand` returns `FORMATTER_UNAVAILABLE` (#2413 contract) rather than `null`, since the static fallback is the same bare binary just proven missing. `detect()`'s own presence-only climb (via this file's private async `findUp`, from the caller's `cwd` rather than the file's own directory) is deliberately NOT merged with `resolvePhpCsFixerConfig` — the two start from different directories and answer different questions ("does config exist anywhere up from `cwd`" vs "which exact file wins from the file's own directory") — the same non-merged shape `rustfmtFormatter.detect` keeps against `resolveCargoPackageEdition`.
 
 ### Rules and analyzers
 
@@ -899,9 +1147,33 @@ formatter config metadata, and tsconfig-path signatures include recursive
 
 `isFullyQualified` follows host path semantics. Use `isFullyQualifiedWin32` or `isFullyQualifiedPosix` when the consuming path grammar is fixed independently of the host (for example, safe-spawn's Windows resolver).
 
-Small process-lifetime memo tables use `clients/bounded-cache.ts` when an
-insertion-ordered LRU cap is sufficient; path-root caches still normalize keys
-at the seam. Widget-state's file map remains a plain map because active
+Every per-file session-fact key in `FactStore`'s bounded map
+(`setBoundedSessionFact`/`getBoundedSessionFact`) writes and reads under one
+normalization per member, applied to both members of the pair. Delta baselines
+(`session.baseline.*`, `dispatcher.ts`) share one per-dispatch constant; the
+cascade baseline (`integration.ts`) and the review-graph
+`changedSymbols`/`entitySnapshot` keys (`clients/review-graph/service.ts` +
+`builder.ts`) fold through `normalizeMapKey` at write and read. A raw-path key
+in this family forks a second empty entity snapshot when one file arrives under
+two case/separator spellings and inverts every symbol to `added` — the #2282 F1
+whole-file-change false positive, re-entered through a re-spelled write (#2355).
+`recordEntitySnapshotDiff` computes that folded path once per call and reuses it
+for both fact keys; do not reintroduce a second realpath probe on this runner
+hot path.
+
+Small process-lifetime memo tables use `clients/bounded-cache.ts`'s two
+primitives: `BoundedFifoMap` (`get` never reorders — a write-side
+`delete`+`set` is the only way to refresh recency) and `BoundedLruCache`
+(extends it, overriding `get` to re-insert so a read promotes). Both share
+one `set()`/`setMaxEntries()` eviction path that returns the evicted
+`[key, value]` pairs, oldest first, so a call site with an eviction side
+effect (freeing a WASM tree, disposing a compiled query) consumes the return
+value instead of hand-rolling `keys()/values()/entries().next().value` or a
+`for (... of map.keys()) { …; break }` walk — any of those three spellings,
+newly added under `clients/`, `tools/`, `mcp/`, or `index.ts`, fails CI via
+`tests/config/bounded-eviction-idiom-sweep.test.ts` unless registered there
+with a `path:line` exemption and a reason. Path-root caches still normalize
+keys at the seam. Widget-state's file map remains a plain map because active
 diagnostic records must not be evicted; it opportunistically removes only
 records idle beyond the active window at one lifecycle size boundary (never
 from every `getOrCreate` call on a full scan) and can therefore temporarily
@@ -939,17 +1211,16 @@ smell warnings count only the current session, or a 24-hour fallback window
 when no session boundary is available; explicit health remains separately
 labeled. (#1432)
 
-The PR body advisory lint may auto-repair only clearly flattened bodies: two or
+The PR body checks normalize only clearly flattened bodies in memory: two or
 more inline template headings, at most two physical newlines, and a minimum
 body length. Detection refuses bodies with escape-loss markers, while the
-post-split structural guard compares repaired heading count with distinct
-template-section count and refuses inconsistent structures. Repair only splits
-inline headings
-whose preceding text ends at body start or sentence-ending punctuation.
-`repairFlattenedBody` is idempotent via its detection short-circuit and must
-pass `lintPrBody` before `patchLivePrBody` writes through the GitHub API; failed,
-stale, or uncheckable repairs report the original errors and never write. The workflow grants
-`pull-requests: write` only to the PR body lint job. (#2145)
+post-split structural guard compares normalized heading count with distinct
+template-section count and refuses inconsistent structures. Normalization only
+splits inline headings whose preceding text ends at body start or
+sentence-ending punctuation. `normalizePrBodyForChecking` returns the body and
+the normalization verdict together, so callers never reclassify a stale event
+payload after checking the live body. The workflow grants the advisory lint
+read-only pull-request access and never edits contributor text. (#2145)
 
 Message-end attribution uses a bounded two-slot session anchor. A primary
 `session_start` rotates `lastStableSessionId` into `previousSessionId` because
@@ -986,6 +1257,19 @@ unknown. Missing stable session identity uses separate primary and secondary
 buckets but still fails correlation closed. Never infer provider behavior from
 stable local bytes, and never serialize transcript evidence.
 (#1016, #1071, #1996)
+
+Automatic test-runner failures use a separate non-context custom-entry surface.
+Completion stages an owner-qualified session/generation record, and
+`agent_settled` delivers only the newest provenance-validated result after an
+immediate `ctx.isIdle()` recheck. The durable `test-runner-findings` cache stays
+available to pull diagnostics and the commit guard; unavailable or failed host
+entry capabilities never fall back to `sendMessage`. (#2366)
+
+Pytest aggregate counts come only from pytest's final outcome summary line
+(#2408), never from a whole-output search. Tracebacks, service errors, assertion
+messages, and captured logs can contain unrelated phrases such as `port 55432
+failed`; summary detection and count extraction must remain bound to the same
+line.
 
 Host-ready delay is a process-lifetime measurement from load-complete to the
 first real `session_start`. The extension consumes that anchor once at the
@@ -1095,9 +1379,14 @@ one slot map and flattening each affected token lane once. File removal falls
 back to a full serialization because it changes slot identity; replacements
 retain their previous wire order. `serializeWordIndex` clears dirty markers only
 after it has produced the view, so deleting the dirty mark makes the stale-
-persist test fail. Snapshot stringify and gzip remain in the existing
-project-snapshot worker; do not send a structured-clone object graph to a new
-worker.
+persist test fail. A reload seeds the flat wire cache only when files, numeric
+metadata, postings, and the optional forward lanes are canonical and mutually
+consistent; sanitized or partial snapshots leave it unseeded so the first
+persist publishes `serializeWordIndexFull` output. The reload check keeps the
+valid wire path structural and uses the duplicate and per-file consistency
+accumulators to reserve deep sanitization for suspicious snapshots. Snapshot
+stringify and gzip remain in the existing project-snapshot worker; do not send a
+structured-clone object graph to a new worker.
 
 Memory-sample subsystem records report the axis that grows and at least one
 byte-denominated estimate. `reviewGraph.residentBytes` uses bounded node/edge
@@ -1142,7 +1431,9 @@ Incremental review-graph updates resolve deferred symbol edges after restoring
 preserved incoming edges. The live indexes must remain synchronized, and
 `dedupeResolvedEdges` removes only post-resolution duplicates from affected
 target buckets. Do not add a second whole-graph dedupe pass to the hot path;
-the next single-file rebuild must also remain duplicate-free. (#2127)
+the next single-file rebuild must also remain duplicate-free. Multi-file removal
+collects removed edges first, then filters each touched adjacency bucket once;
+per-edge `indexOf`/`splice` in a high-fan-in bucket is quadratic. (#2127, #2074)
 
 ### Git guard
 
@@ -1276,6 +1567,32 @@ drift; the merge call passes `sha` so a head that moves mid-cycle 409s instead
 of merging on a stale verdict. Only the maintainer applies the label, so the
 adversarial-review-first policy is unchanged; removing the label aborts.
 
+After a successful merge, `runMergeLane` reads a strict 40-hex merge SHA and
+sends a `merge-train-post-merge` `repository_dispatch` payload containing
+`{repository, sha, pr_number}`. The lane uses this event because its
+`GITHUB_TOKEN` merge suppresses the ordinary `push` event. Transient HTTP
+failures and ambiguous timeouts receive one bounded retry with the same SHA;
+the scheduled lane also reconciles recent bot-merged PRs from a dedicated
+GraphQL connection ordered by `UPDATED_AT` descending. That reader follows
+cursors only until the last `updatedAt` is strictly older than its merge window,
+preserves equality at the cutoff, and fails closed on ordering, cursor, shape,
+or page-cap violations. It reads `mergedAt`, `mergedBy`, and the exact merge
+OID in the same record, rather than relying on the REST pull-list's incomplete
+merge identity. It waits through a
+bounded grace period, retries missing validation across process restarts, and
+opens a later six-hour retry generation after two attempts exhaust one
+generation, without a hot loop. It accepts completion only from bot-authored
+exact-SHA terminal markers. A final
+failure leaves the merge landed but records a fatal post-merge-validation
+error. The master-push validation workflows (`ci.yml`, `lint.yml`,
+`install-smoke.yml`, and `labels.yml`) gate all repository actions behind a
+dispatch prerequisite that validates repository identity, strict SHA and PR
+number shape, trusted workflow-revision checkout, authenticated commit
+resolution, and ancestry to `master`; downstream jobs then check out the exact
+payload SHA. They use per-workflow SHA concurrency with cancellation so duplicate
+dispatches cannot validate one commit concurrently. A missing or invalid merge
+SHA means no dispatch, and the lane must never report that verification ran.
+
 Four facts about THIS repository the lane must keep matching, each probed live
 rather than assumed (review round 1 on PR #2191, all four were wrong first):
 master protection is `strict: true`, so a BEHIND head cannot be merged at all
@@ -1306,11 +1623,12 @@ and unit-tested; workflow YAML supplies the token required by the live fetch.
 ```
 index.ts                  Extension entry point (async factory) — the pi host adapter
 mcp/                      Second host adapter: MCP server + hook bin (see "MCP mirror")
-  server.ts               Hand-rolled stdio JSON-RPC MCP server (16 tools) + warm IPC listener
+  server.ts               Hand-rolled stdio JSON-RPC MCP server (18 tools) + warm IPC listener
   worker.ts               fresh-mode child (loads freshly-built code from disk)
   analyze-cli.ts          pi-lens-analyze bin — PostToolUse hook + CLI (warm channel → cold fallback), plus the Stop-hook turn-end mode (warm-only)
 clients/
   lens-engine.ts          THE internal seam — host adapters import only this for pi-lens functionality
+  effective-config.ts     "why is X running/selected" — resolved config + provenance + per-file server/tool decisions (#2427)
   mcp/                     host-neutral facades: analyze, session, review, ipc, host-shim
   runtime-session.ts      session_start handler — snapshot hydrate, tool preinstall, background scans, LSP warm
   project-snapshot.ts     Versioned seq-stamped project snapshot cache
@@ -1415,19 +1733,204 @@ mtime bound (`scripts/lib/suite-lock.mjs`'s `staleMaxAgeMs`) — but unlike
 test-suite run has no bounded duration for a timeout to be sized against (an
 install does). See that file's header for the PID-reuse tradeoff this
 implies. Opt out with `PI_LENS_TEST_NO_LOCK=1` (CI sets this — runners are
-isolated, one job per box, nothing to serialize against). Only `npm test` /
-`test:unit` / `test:integration` acquire the lock; a targeted single-file run
-via `npx vitest run <file>` directly stays unlocked (cheap, and serializing
-it would hurt iteration) — `npm test -- <file>` still goes through the
-wrapper and queues, since it's the same npm script.
+isolated, one job per box, nothing to serialize against).
+
+**Targeted runs go through `npm run test:targeted` (#2435).** That is
+`with-test-lock.mjs --shared -- vitest run`, which takes one of N concurrent
+SHARED slots (default 2, `PI_LENS_TEST_SHARED_SLOTS`) instead of the
+exclusive lock: `npm run test:targeted -- tests/a.test.ts tests/b.test.ts`.
+It REQUIRES at least one path or glob and exits 2 otherwise: with no
+arguments it would collect the whole suite while holding a *shared* slot,
+which is the contention the exclusive lock exists to prevent, reached through
+the mechanism added to relieve it. A full run is `npm test`.
+Targeted batches used to bypass the lock entirely by design — cheap
+individually, but 4-6 agents running them at once saturate the box and
+manufacture exactly the timeout/spawn-budget flake class the exclusive lock
+exists to prevent (the #2435 evidence: 27-69 such failures per local full
+run, none reproducible in isolation). The two modes compose: an exclusive
+acquisition now waits until every shared slot has drained, and a shared
+acquisition waits while the exclusive lock is held, so a full run still gets
+the machine to itself. `npx vitest run <file>` invoked directly still
+bypasses everything — use it only for a single file you are iterating on.
 Companion policy for agents running tests concurrently: run touched-file
-tests freely (unlocked, cheap, iterate fast); at most ONE full-suite run per
+tests through `test:targeted`; at most ONE full-suite run per
 agent at the end, with `PI_LENS_TEST_MAX_WORKERS=4` (not the default 50%) to
 keep that one run's own footprint bounded; GitHub CI is the authoritative
 full-suite green, not a local run under load; and under load, crash-cascade
 failures (the classic pattern: edits.test occupancy dragging down
 unrelated siblings) must be re-run in isolation before being treated as
 real regressions.
+
+**Agent worktree + orphan-process hygiene (#2435).**
+`scripts/prune-agent-worktrees.mjs` (`npm run hygiene`, `--dry-run` first)
+removes `.claude/worktrees/agent-*` trees that are clean, whose HEAD is
+contained in an `origin/*` ref, and that have been IDLE for at least 30m — and
+kills `tests/fixtures/*` / `tests/support/*` helper processes whose parent has
+exited (the leak that left a `fake-lsp-server.mjs` running for an hour and
+made one worktree unremovable; the fixture's own missing teardown is #2436).
+Rails: never a dirty tree, never an unpushed one — no flag overrides either;
+`--only` overrides only the age and live-lock rails; a fixture helper with a
+LIVE parent, or with no readable parent pid at all, is never killed; a kill
+needs a STRUCTURAL signal (the process's cwd inside the tree, or the
+executable/script it is actually running inside it) — a mention of the path
+anywhere else on a command line is a reader, not an occupant; kills are by
+pid, never `taskkill`-by-name. All of that is pure and unit-tested in
+`scripts/lib/worktree-hygiene.mjs`.
+
+**One process-table seam, in scripts/ (#2443).** Every Windows
+`Get-CimInstance Win32_Process` and POSIX `ps` listing in this repo is
+composed and parsed in ONE place, `scripts/lib/process-scan.mjs`:
+`buildProcessQuery(fields, {filter, excludeSelfPid})` builds the command,
+`parseProcessTable` reads it back, and a `fields` projection (`pid`, `ppid`,
+`ageMs`, `rssBytes`, `cpuKernel100ns`, `cpuUser100ns`, `startedAt`,
+`command`) is how a caller asks for the columns it needs. There used to be
+five copies — the instance reaper's three queries, the resource sampler's two,
+and the two scripts — which is how PR #2438's exit-code hardening (a `ps` that
+prints a partial table then dies must not read as complete) reached one and
+not the rest. `tests/config/process-table-seam.test.ts` fails on any second
+file that spells the query.
+
+The seam lives in `scripts/` and NOT in `clients/` on purpose: `clients/*.js`
+is gitignored build output, and `scripts/prune-agent-worktrees.mjs` runs as a
+SessionStart/SubagentStop hook inside freshly created agent worktrees, which
+have neither `node_modules` nor a build. clients/ reaches it through the ONE
+crossing point, `clients/process-snapshot.ts`, which adds the extension's own
+spawn rails (unref'd child + stdout, injected tree-kill-and-verify timeout
+handler, a `SpawnCollectStatus` so an empty table stays distinguishable from
+a query that never ran). Because tsc resolves the `.mjs` through its
+`.d.mts` and would emit nothing, `tsconfig.dist.json` names the file in
+`include` with `allowJs` — without that, `bundle:dist` cannot resolve the
+import (pinned in `tests/packaging.test.ts`).
+
+**Idle is measured from signals the sweep does not write.** A worktree's age
+comes from `WORKTREE_ACTIVITY_SIGNALS` — the checkout directory's mtime, the
+worktree's `<admin>/HEAD` mtime, and the last entry timestamp in
+`<admin>/logs/HEAD` — and NEVER from `<admin>` or `<admin>/index`. The sweep
+asks `git status --porcelain` whether a tree is dirty, and that rewrites the
+index and bumps the directory holding it: reading either made every candidate
+`age 0ms` the instant it was inspected, so `too-young` rejected all of them
+and the sweep silently removed nothing for its whole first life. Any new
+activity signal must be proven unchanged across a `git status` before it is
+added to that list; the reflog is read for its recorded ENTRY time, not its
+mtime, so copying a tree cannot forge freshness.
+
+**Who removes what.** `SubagentStop` as REGISTERED **reaps the tree of the
+agent that just stopped** — derived from the payload's `agent_id`, under the
+unchanged dirty/unpushed rails (#2486). This reverses PR #2438's review S1
+(maintainer decision, 2026-09-02). S1 forbade removal here because
+resume-by-SendMessage lands after the hook fires; the cost was #2486 — the
+registered line passes no `--only`, so it removed nothing, only
+`SessionStart`'s one-tree-per-run cap drained anything, and ten stale trees
+accumulated in a single afternoon and were cleared by hand.
+
+**The trade-off, stated plainly.** An agent resumed by SendMessage after its
+tree was reaped must recreate the checkout. Its BRANCH survives — branches are
+deleted only for a removal that succeeded, and only the ref that removal
+orphaned, and a tree is never removed unless its HEAD is already contained in
+an `origin/*` ref — so nothing committed is lost; only the working copy goes.
+Operators who routinely resume agents turn the removal off with
+`--keep-agent-tree`, or `PILENS_HYGIENE_KEEP_AGENT_TREES=1` when the
+registered hook line cannot be edited; the scoped orphan-fixture sweep still
+runs and the ledger records `keptReason: "removal-not-permitted"`.
+Merge-train worktrees are never `agent-*` trees, so `isAgentWorktreePath`
+never selects them either way. `--hook subagent-stop --only <tree>` stays the
+manual form for a caller at a terminal and resolves to exactly the `manual`
+policy (it was a separate table entry whose six fields were identical — a
+hand-maintained mirror, which this repo's single-source-of-truth rule forbids).
+Removal belongs otherwise to
+`SessionStart` (default 30m min-age, at most ONE tree per run so the removal
+fits inside the 90s hook timeout — `git worktree remove` is itself bounded at
+60s with SIGKILL) and to a manual `npm run hygiene`. The `SessionStart`
+registration carries `"matcher": "startup|resume"`, so the sweep runs when a session begins
+or resumes and NOT on `/clear`, compaction or a fork — without it a long
+session re-ran the whole sweep every time it auto-compacted, roughly every
+20 minutes. Both hooks are registered in
+`.claude/settings.json` — the one project-level Claude Code settings file this
+repo tracks, hooks and nothing else; `settings.local.json` stays ignored as
+per-developer permission state. Both are `--quiet` and always exit 0.
+
+Kills, removals and DEGRADATIONS are recorded as bounded JSONL in
+`<PILENS_DATA_DIR | PI_LENS_HOME | ~/.pi-lens>/hygiene.log`. The orphan
+predicate reads "parent absent from the snapshot" as "parent exited", so a
+truncated listing would read every live helper as an orphan: the sweep
+refuses to run unless the listing exited 0 and contains this process plus
+every ancestor that is still alive, and records `hygiene.scan-degraded`
+instead of quietly killing nothing.
+
+EVERY invocation also writes exactly one `hygiene.run` record — `fired`, or
+`skipped` with a reason from `RUN_SKIP_REASONS` (#2486). Both hooks are
+`--quiet` and Claude Code discards their stderr, so before that an early
+return was indistinguishable from a hook that never fired: ten finished
+agents' trees accumulated behind a ledger that said nothing at all. The two
+skip reasons are kept apart on purpose — `no-agent-id` (no `agent_id` on
+stdin) versus `agent-worktree-missing` (a perfectly good `agent_id` whose
+`.claude/worktrees/agent-<id>` does not exist, which is the ORDINARY case
+because most subagents are not worktree-isolated). A run that FIRED, found its
+one tree and then refused it carries `keptReason` — the `planWorktreePrune`
+rail that refused it (`dirty`, `unpushed`, `self`, `locked-live`),
+`removal-not-permitted` for the opt-out, or `deferred` for a per-run cap.
+Without it a protected dirty tree and a hook that reaped nothing for no stated
+reason are the same line, which is #2486's own shape one level down.
+`hygiene.scan-degraded` likewise separates `remainingMs` (what was left of the
+sweep budget) from `ceilingMs` (the bound the listing was actually given);
+writing the ceiling into `remainingMs` made a skipped scan report a budget it
+never had.
+
+A worktree removal is INDEPENDENT of the process listing. The listing feeds
+only the orphan sweep and the kill-what-holds-the-tree step; when it fails or
+is skipped, both degrade visibly and the removal still runs. Budgets come from
+the timeouts registered in `.claude/settings.json` (`HOOK_TIMEOUT_MS`, pinned
+to that file by a conformance test): `hookBudgetMs` gives SessionStart
+`90s - 60s removal reserve - 1s recheck reserve - 5s margin = 24s` and
+SubagentStop `15s - 5s removal reserve - 1s recheck reserve - 5s margin = 4s`,
+floored at `DEFAULT_HOOK_BUDGET_MS` (2s) for an unregistered event. Adding that
+1s recheck reserve (round 4, N3) shrank SubagentStop's own enrichment window
+too, as a side effect: `scanReserveMs(budgetMs, scanTimeoutMs)` reserves
+`min(scanTimeoutMs, budgetMs / 2)` for the process listing, so the 4000ms
+budget above (down from 5000ms before N3 added the recheck reserve) halves to
+a 2000ms listing reserve — leaving enrichment `4000 - 2000 = 2000ms`, down from
+`5000 - 2500 = 2500ms` pre-N3 (PR #2493 round 5, R3). The removal
+reserve is per hook (`HOOK_REMOVE_RESERVE_MS`) and is the SAME number `git()`
+bounds the removal with (`removeBoundMs`); the recheck reserve
+(`RECHECK_TIMEOUT_MS`, 1s) is the SAME number the pre-remove `isDirty()`
+recheck is bounded with (`recheckBoundMs`) — so
+`budget + recheck + removal + margin <= hook timeout` is enforced rather than
+asserted — a reserve no call honors is a claim, not a bound. The recheck used
+to silently reuse `removeBoundMs`, a SECOND removeBound-sized `git()` call the
+invariant never counted, and subagent-stop's real worst case reached ~20s
+against its own 15s timeout (PR #2493 review round 4, N3) before it got a
+reserve of its own. `removeBoundMs`'s 60s is right where there is room
+(SIGKILLing git mid-delete leaves a half-removed tree); SubagentStop has none,
+so it takes 5s against a measured `git worktree remove --force --force` cost
+of 956/1049/1171ms min/median/max over a 4000-file worktree (146/181/755ms
+over a 300-file one), 2026-09-02 on the #2435 box; the recheck's own 1s is a
+`git status --porcelain`, far cheaper still, and a timeout there reads as
+`"unreadable"` — kept, exactly like a genuinely dirty tree, never destroyed.
+The recheck runs BEFORE `unlinkTopLevelLinks` unlinks the shared
+`node_modules` junction (PR #2493 round 4, N1): unlinking first meant a tree
+kept for "became dirty" had already silently lost that junction, with no
+record of it anywhere a `--quiet` hook run would surface. The
+enrichment-to-removal gap is narrowed by this recheck, not closed: a write
+landing in the few hundred milliseconds between the recheck itself and
+`git worktree remove` is not caught by any ledger record. The process listing
+has its own ceiling,
+`DEFAULT_SCAN_TIMEOUT_MS` = 4000ms against a measured 584/651/707ms
+min/median/max for a 467-row Windows listing, overridable with
+`--scan-timeout-ms` so a short listing ceiling can never squeeze the `git`
+calls that decide whether a tree is removable — and the enrichment reserves
+that ceiling only up to HALF the sweep budget (`scanReserveMs`), because
+reserving all 4s out of SubagentStop's 4s budget would leave every enrichment
+`git` call on its 250ms floor, which `isDirty` reads as `"unreadable"` and the dirty rail
+still keeps the very tree the hook fired to reap — but as of PR #2493 review
+round 3 (F2) the ledger says WHY with a `keptReason` of `"status-unreadable"`,
+not `"dirty"`, so a budget too tight to ask is never misread as protected
+uncommitted work.
+
+The SubagentStop payload is Claude Code's contract, not ours: `agent_id` is
+required on that event and a managed agent worktree is named `agent-<agentId>`
+(read from the shipped binary, per defect shape 16 — never paraphrased from
+docs). There is no worktree-path field on the event, so the derived path is
+verified on disk before the sweep acts on it.
 
 Whole-project loops that reuse one `FactStore` must delete `file.content` after
 that file's consumers finish (in a `finally` so abort/error exits release it).
@@ -1457,7 +1960,7 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   `npm install --omit=dev` does **not** omit `optionalDependencies` (only
   `--omit=optional` does, which pi doesn't pass), so even an "optional" SDK would
   weigh every pi-lens install. ~200 LOC beats a dep for a tools-only server.
-- **16 tools in a source checkout (15 in an installed package):** `pilens_analyze`
+- **18 tools in a source checkout (17 in an installed package):** `pilens_analyze`
   (per-edit; `mode: warm|fresh`), `pilens_diagnostics`,
   `pilens_project_scan`, `pilens_latency`, `pilens_health`, `pilens_rebuild`
   (source checkouts only: `clients/mcp/review.ts`'s shared
@@ -1590,6 +2093,28 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   engine seam and returns the identical #517-slimmed payload; unlike read_symbol/
   read_enclosing it does not feed the read-guard (a ranked file list is discovery,
   not a body read).
+  `pilens_effective_config` (#2427, dual-surface — `tools/effective-config.ts`,
+  wired in `index.ts`) is the 18th tool and the answer to **"why is X running /
+  why is X NOT running"**, which used to cost log forensics across
+  `lsp/config.ts`, `language-policy.ts` and the trust state. It returns the
+  resolved config with every leaf's provenance (tier / file / key / trust), and
+  for a named `file` its canonical language plus every LSP server with the
+  reason it was selected or denied and every runner that would dispatch.
+  `clients/effective-config.ts` is a FACADE, not a computation: it reads the
+  answers back from `resolvePiLensConfig`, `explainServersForFile`,
+  `detectFileKind`/`getToolPlan`/`getAvailableRunners`, and decides nothing
+  itself — an introspection surface with its own copy of the selection rule
+  would eventually describe a runtime that no longer exists. `pilens_health`
+  embeds the same provenance as per-tier COUNTS only. Redaction is structural,
+  not a mode: paths are `~`-relative, a custom server's argv is cut to
+  `argv[0]`, env is reduced to NAMES, and there is no `redact: false` to
+  spell. Two seams it forced, both single-source moves rather than new copies:
+  `explainServersForFile` in `clients/lsp/config.ts` is now THE server-selection
+  evaluation and `getServersForFileWithConfig` is a projection of it (the three
+  gates — disabled / extension-or-basename / `pathFilter` — are evaluated once
+  and reported twice), and `tests/support/public-surface-drift.ts` holds the
+  generalized drift-guard harness that `lsp-fixture-coverage.test.ts` now
+  consumes and that #2416/#2383 register their catalogs against.
 - **MCP-only vs pi-lens-internal (a real gap to close, not a finished story).**
   Likewise `module_report`'s blast-radius (#304) uses
   *transitive* BFS (`computeTransitiveImpact`) while
@@ -1628,6 +2153,12 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   delayed warmup child phases in `latency.log`; concurrent secondaries emit only
   `concurrent_session_bind`. Keep logging fire-and-forget and preserve contiguous
   top-level timing so quick-start child durations remain within ~10 ms of total.
+  `session_start_total.metadata.classification` carries the accepted start's
+  `primary` or `sequential-replacement` decision, and `sameRoot` carries
+  `true`, `false`, or the explicit bounded value `"unknown"`; never omit the
+  field when root identity was unavailable because NDJSON serialization drops
+  `undefined`. The quick and full writers share this durable shape, and strict
+  readers must accept only those three root values. (#2129)
   #1019: `session_start_log_cleanup` is now emitted from a deferred `setImmediate`
   (its `metadata.deferred:true`), NOT synchronously in the awaited chain, so it is
   no longer a top-level critical-path phase — do not re-add it to the contiguous
@@ -1830,11 +2361,21 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
 
 ## Package scope
 
-LSP server definitions resolve in `clients/lsp/config.ts` as project
-`.pi-lens/lsp.json` (including its legacy project filenames) over machine-global
-`getGlobalPiLensDir()/lsp.json` over built-in defaults. `servers` and
-`serverOverrides` merge by ID; project `disabledServers` and `warmFiles` replace
-the global arrays when present.
+**Config location is settled and documented in ONE place: `docs/configuration.md`
+("Which file wins", #2426).** There are exactly two canonical files —
+`.pi-lens.json` (project, nearest-package-wins per field) and
+`~/.pi-lens/config.json` (machine-global) — with `lsp` as a namespace inside
+both. Every loader resolves through `clients/config-resolve.ts` over the
+canonical schema in `clients/config-schema.ts`, in the config core's own tier
+order (builtin → global → project → nested-project → env → cli → host); the
+walk is `$HOME`-ceiling-bounded like every other walk-UP in the repo. Legacy
+locations (`.pi-lens/lsp.json`, `pi-lsp.json`, `pi-lens.json`,
+`~/.pi-lens/lsp.json`) and the legacy root LSP keys are still read for the
+window in `DEPRECATED_CONFIG_SURFACES`, emit one `PILENS_CFG_0002`/`0003`
+migration notice per `(file, key)`, and LOSE every collision with the canonical
+spelling. Do not add a fourth discovery path, a second candidate list, or a
+per-loader merge: add a location to `clients/config-locations.ts` and a
+namespace to the schema.
 
 All pi packages are `@earendil-works/*` (migrated from `@mariozechner/*` in 0.74.0). Peer dep: `@earendil-works/pi-coding-agent`. Runtime dep: `@earendil-works/pi-tui`. The v4-safe dependency baseline resolves both host packages at `0.84.2`; the peer remains broad at runtime and the devDependency pins the SDK for type/compatibility checks. Re-audit host declarations before taking a future major/minor bump.
 
@@ -1846,7 +2387,7 @@ All pi packages are `@earendil-works/*` (migrated from `@mariozechner/*` in 0.74
   - Why: PRs squash-merge. A PR based on a feature branch gets merged *into that branch*, not master; if the base was already squashed to master, those commits land on a dead branch and never reach master. This happened (#321/#302 → reland #322).
   - Verify a merge actually hit master before moving on: `git show origin/master:<file> | grep <new-symbol>` — not just the PR's "merged" badge.
 - **When told (or when you observe) that a PR merged, fast-forward local `master` immediately — don't ask first.** `git fetch origin master && git merge --ff-only origin/master` (check `git status --short` beforehand as usual; leave any unrelated stray modified files untouched). This is pre-authorized standing behavior, not a per-instance confirmation.
-- Lint gate is `tsc` (`npm run lint`); the repo has **no biome config or CI biome gate**, so biome's default formatting is *not* enforced — don't repo-wide reformat. Run the full suite (`npm test`) before pushing; `npm run build` first if stale JS may shadow source edits.
+- Lint gate is `tsc` + `oxlint` (`npm run lint` = `tsc --project tsconfig.json && npm run lint:js`, the latter oxlint `--deny-warnings` per `.oxlintrc.json` over `.mjs`/`.cjs`/plain `.js` PLUS the production TypeScript tree — `clients/`, `tools/`, `mcp/`, root `index.ts` (#2454; `tests/**`/`cases/**` TS stayed ignored until #2454, `cases/**` dropped as dead-clean in #2454's review round, `tests/**` TS remains ignored — tracked by #2462 — `no-undef` stays off for `.ts`/`.tsx`, tsc is the source of truth there)); the repo has **no biome config or CI biome gate**, so biome's default formatting is *not* enforced — don't repo-wide reformat. Run the full suite (`npm test`) before pushing; `npm run build` first if stale JS may shadow source edits.
 - **Format gate is `oxfmt` (`npm run fmt:check`) and it must run before EVERY commit and push.** The deferred-format lane drains at `agent_end`, so a violation pushed MID-TURN escapes ahead of the formatter and reds the CI advisory (seen repeatedly 2026-08-23/24: three pushes raced the drain). Files written by scripts (bash/python heredocs) are especially exposed — write tools on Windows emit CRLF that oxfmt rejects as mixed EOL. If you skip hooks on a push (`PI_LENS_SKIP_HOOKS=1`), run `fmt:check` manually anyway.
 
 ## Issue triage (standing rule)
@@ -1861,7 +2402,7 @@ All pi packages are `@earendil-works/*` (migrated from `@mariozechner/*` in 0.74
 ```
 npm test              # vitest run (all tests)
 npx tsc --project tsconfig.json --noEmit   # type-check
-npm run lint          # same as type-check
+npm run lint          # tsc type-check + oxlint (npm run lint:js) over .mjs/.cjs/.js AND clients/tools/mcp/index.ts, --deny-warnings (tests/** TS still ignored, tracked by #2462)
 npm run build         # emit JS from TS; run before tests after source changes if stale JS may be present
 node scripts/smoke-tools.mjs [--install] [--step2] [--verbose] [lang ...]   # live tool-smoke (#209, opt-in/nightly): installs + runs each tool through the REAL dispatch path against tests/fixtures/tool-smoke/<lang>/; --step2 also asserts a parseable diagnostic. Add --lsp for the LSP-handshake layer, --format for the formatter pipeline, or --autofix for the pipeline safe-autofix phase. Not a per-PR gate, not shipped in the tarball.
 #   --lsp fixtures support two optional per-fixture fields (#530): `setup` (string/argv command run in the COPIED temp workspace before touchFile — e.g. `typescript7`/`typescript7-clean` run `npm install typescript@7 --no-save --no-audit --no-fund` there, since typescript-go's per-platform native binary can't be a committed static fixture; setup failure reports a distinct `setup-failed` status, never a false pass, bounded by a 120s timeout) and `expectLaunchVariant` (asserts the live `getCapabilitySnapshots(file)` `launchVariant` — e.g. `"native-ts7"` — so a silent fallback to the classic `typescript-language-server` FAILS even though a diagnostic arrived; the native and classic servers share the same `"typescript"` server id, so the diagnostic alone can't distinguish them). Both fixtures verified live 2026-07: typescript@7.0.2 installs from npm, its `tsc --lsp --stdio` genuinely speaks LSP framing (`\r\n\r\n` Content-Length headers over stdio, confirmed via a hand-rolled initialize), and PR #526's assumed invocation is correct.
@@ -1924,6 +2465,10 @@ Never write `path.join(cwd, ".pi-lens", ...)` for a project cache — it breaks 
 
 **Test hermeticity for machine-global state (#525, refs #515).** `tests/support/vitest-setup.ts` sets `PI_LENS_HOME` to a per-worker `mkdtemp` directory for every test run — unlike `PI_LENS_CONFIG_PATH` (#515, pointed at a nonexistent path since config-loading is read-only-by-default), this MUST be a real, writable directory because the instance registry and loggers actively `mkdir`+write into it. Dogfooding caught the gap live: a test-fixture instance (`registerInstance` called from a test with no override) survived in the developer's REAL `~/.pi-lens/instances.json` for ~17h. A test that deliberately exercises the real (non-overridden) resolver — e.g. asserting the literal `~/.pi-lens` default, or a `node:os` mock forcing a fake homedir — must construct its OWN explicit override (`delete process.env.PI_LENS_HOME` / restore afterward) rather than relying on unsetting the global vitest-setup value; see `tests/clients/file-utils.test.ts`'s `getGlobalPiLensDir` suite and `tests/clients/installer/tool-discovery.test.ts` (which clears `PI_LENS_HOME` via `vi.hoisted`, before its module-level `const GITHUB_BIN_DIR = path.join(getGlobalPiLensDir(), ...)` import ever runs) for the pattern. `tests/clients/pi-lens-home-hermeticity.test.ts` is the regression guard proving `registerInstance` never touches the real homedir when the override is set.
 
+**Two global-dir resolvers: `getGlobalPiLensDir()` for machine state, `getGlobalPiLensLogDir()` for telemetry (#2506).** vitest is hermetic (the `PI_LENS_HOME` pin above), but an ad-hoc probe against the BUILT `clients/*.js` — a bare `node -e`, a throwaway `.mjs`, a harness script run OUTSIDE vitest — has no test-mode gate and no home pin at all, so every logger/ledger it touches used to fall straight through to the real `~/.pi-lens`. Confirmed live on 2026-09-02: two review probes run this way left 42 rows of fixture garbage in the maintainer's real telemetry. **`getGlobalPiLensDir()` (`clients/file-utils.ts`) is deliberately cwd-INDEPENDENT** and resolves the state a session must KEEP wherever it runs from: installed tool binaries (`tools/`, `bin/`), the cross-process instance registry (`instances.json`) and its orphan-backstop lease, the auto-install probe cache, the canonical global `config.json`, LSP server storage (intelephense's index, PSES's per-PID session dir) and JVM runtimes. Redirecting THAT function — as this issue's round-2 attempt did — silently gives every worktree its own empty tool tree and its own private registry the reaper cannot see across, a worse defect than the pollution it fixes. **`getGlobalPiLensLogDir()` carries the redirect** and is what the log family uses: `latency`, `extension`, `sessionstart`, `cascade`, `read-guard`, `tree-sitter`, `word-index`, `bus-events`, `dispositions`, `dead-code`, `ast-grep-tools`, `actionable-warnings`, `review-graph`, the `logs/*.jsonl` diagnostic dir, the debug handle/heap dumps, `log-cleanup.ts`'s sweep, and `smells-rollup.ts`'s read-side tail of `latency.log`/`bus-events.log` (a reader, but it must follow the same root or it tails a file nobody writes). It redirects to `<probe root>/.pi-lens-probe-home` when `PI_LENS_HOME` is unset and either `PILENS_PROBE=1` is set or — outside `isTestMode()` — the cwd sits inside a SPECIFIC agent worktree (`.claude/worktrees/<worktree>/...`; the shared `.claude/worktrees` parent is deliberately excluded, or every concurrent agent would collide in one directory) or under `os.tmpdir()` (both sides realpath'd first, or macOS's `/var` → `/private/var` symlink makes that branch dead). **Consequence, by design: a pi session in a worktree or temp project keeps its tools and its registry entry; only its logs and ledger move.** New machine-global path → `getGlobalPiLensDir()`; new log/telemetry path → `getGlobalPiLensLogDir()`.
+
+The redirect resolves ONCE per process and is memoized in `clients/probe-home-state.ts`'s single `globalThis` slot (decision + degradation event together, so one reset clears both) — reading `process.cwd()` live gave one process three different roots as it chdir'd. It records a `global-dir-probe-redirect` degradation, folded into `getDegradationSummary()` at READ time, the same inversion `log-sink-write-failure`/`process-singleton-reset` use. Two hard constraints on that plumbing, both learned the expensive way: (1) it must NOT write to the terminal — #1333 gives pi sole ownership of the TTY and `tests/clients/extension-terminal-silence.test.ts` fails any `process.std*.write`/`console.*` under `clients/` (round 2 shipped a `process.stderr.write` here and was red in CI for it); logging through `extension-log.ts` is equally out, since that module already imports `file-utils.ts` and the reverse edge would close a new `no-client-cycles` cycle. (2) `file-utils.ts` must not import `probe-home-state.ts` at all, zero-import leaf though it is: `log-cleanup.ts` calls `getGlobalPiLensLogDir()` at its OWN module top level and reaches the resolver through the pre-existing `safe-spawn`/`degradation-ledger`/`extension-log` cycle while `file-utils.ts` is still mid-init, and in that window an import BINDING is uninitialized too — `ReferenceError: Cannot access '...' before initialization`, hit twice on this issue (once as a module-scope `const`, once as the import). So both modules name the same `Symbol.for` key as a literal, pinned equal by a test, and neither declares a module-scope binding for it. `.pi-lens-probe-home/` is gitignored: without that, every agent worktree that ran one probe stays dirty forever and #2435's clean-only worktree sweep can never reap it. `getProjectDataDir(cwd)` composes through `getGlobalPiLensDir()`, not the log one — a probe's project caches are already isolated by its own path slug. See `.claude/agents/pi-lens-fixer.md`'s "Probe hygiene (mandatory)" section for the companion rule: pin `PI_LENS_HOME` yourself before any such probe rather than relying on this fallback, which exists to bound the blast radius of forgetting, not to replace the pin.
+
 ## Debug logs
 
 **All debug loggers write through one buffered async writer** — `clients/ndjson-logger.ts` `createNdjsonLogger` (#454/#935): `log()` is sync-call/async-write (serialized drain, no `appendFileSync` on the per-edit hot path); contiguous queued lines coalesce into one O_APPEND write up to a truncate boundary, while peek-then-remove plus identity-checked completion preserves exit-flush safety. Rotation + truncate are in-band queue ops; normal drains use promise-based mkdir/append/truncate, but rotation's stat/remove/rename remains one synchronous section inside the already-deferred drain (and exit flush), so `flushSync` cannot race a late async rename. A late in-flight write crossing a truncate gets a post-truncate replay, and a single shared `process.on("exit")` handler sync-flushes every logger. The Symbol.for process-global state also owns one canonical queue/flusher per normalized absolute path, so module re-evaluation/hot reload cannot create competing writers or retain one flush closure per facade; the state is explicitly versioned. The 7e4b9120 shared-writer shape is upgraded in place, replacing each stale exit flusher with the current `flushStateSync` closure while preserving queues; a pre-7e4b9120 graph with private queues is fenced and fails closed because those queues are not migratable. A second facade for that path must use the same `maxBytes`/`backupPath` options; incompatible options fail at construction rather than silently inheriting first-writer settings. Static paths are canonicalized once at logger creation, and lazy paths cache canonicalization by resolved raw path; log-cleanup directory comparisons use the shared `pathsEqual` seam. `sessionstart.log`'s ordinary writers all route through the single module-level instance in `clients/sessionstart-logger.ts`; the sole exception is `clients/lsp/launch.ts`'s intentionally synchronous crash-adjacent final diagnostic. Latency/cascade/tree-sitter/bus-event loggers rotate in process at `getMaxLogSizeMB()` (PI_LENS_MAX_LOG_SIZE_MB, default 10 MB) — the SAME source cleanup and `/lens-perf`'s tail bound read, so raising the env var moves all three together. Exit-flush contract: flushSync drains the whole queue INCLUDING an in-flight async batch — duplicate lines at exit are accepted over dropped lines (#935 review); rotation is complete before an async append is allowed to become in-flight, and the in-flight append/truncate replay preserves post-truncate ordering. One deliberate durability trade: `dbg()` lines are buffered, so a hard kill (SIGKILL/native crash) can lose the tail that the old per-call appendFileSync would have kept; launch.ts's sync exception covers the spawn-crash case. **A test (or any in-process reader) that reads a log file right after logging MUST `await` that module's exported `flush<X>Log()` first** — the line may still be in the write queue. New logger = one `createNdjsonLogger` call in a thin module keeping its own schema/API; don't hand-roll append/rotate again.
@@ -1970,7 +2515,11 @@ Tracks modified file ranges per turn for turn_end targeting, bumps project/file 
 IaC per-edit scheduling covers Docker, Kubernetes YAML, Terraform, and content-gated CloudFormation JSON. Compose remains deferred. Keep every `RunnerDefinition.appliesTo` kind represented by a static plan group or an explicit dynamic scheduling declaration. (#1757, #2323)
 
 **`turn_end`** → `handleTurnEnd` (`clients/runtime-turn.ts`)
-First **settles** the turn's deferred cascade computes with a bounded wait (`settleCascadeRuns`, cap via `PI_LENS_CASCADE_SETTLE_WAIT_MS`, default 5000ms; a late compute is carried over to the next turn_end rather than lost), then merges unresolved inline blockers and cascade findings, writes latest-turn actionable/code-quality warning reports with sequence metadata, runs Knip delta analysis when the startup scan is not in flight, runs Madge circular-dependency checks for files whose imports changed, and fires related/failed tests asynchronously for the next context injection. Reads the session-scan caches and surfaces them. **Secrets** (`gitleaks` + `trivy secret` + the ast-grep `*-hardcoded-secret-*` rules) are collapsed **by location** via `clients/secret-findings.ts` (`dedupeSecretFindings`) into a single 🔴 blocker with combined provenance (`[gitleaks + trivy + ast-grep]`) — the rule-keyed diagnostic dedup can't merge them since each source uses a different rule id; the duplicate ast-grep advisory copy is suppressed from the actionable-warnings report at the blocked locations (#131 Mode 3). Trivy **CRITICAL** CVEs are 🔴 blockers ("upgrade before shipping"); `govulncheck`/Trivy non-critical CVEs are advisories (FixedVersion as an upgrade hint — never auto-edits lockfiles). Trivy **license risk** (copyleft/restricted licenses, #131 Mode 4) is a 📜 advisory from the same `trivy fs --scanners vuln,secret,license` pass. Deduplicates findings against previous turn state and injects blockers (🔴) and advisories into the agent's context.
+First **settles** the turn's deferred cascade computes with a bounded wait (`settleCascadeRuns`, cap via `PI_LENS_CASCADE_SETTLE_WAIT_MS`, default 5000ms; a late compute is carried over to the next turn_end rather than lost), then merges unresolved inline blockers and cascade findings, writes latest-turn actionable/code-quality warning reports with sequence metadata, runs Knip delta analysis when the startup scan is not in flight, runs Madge circular-dependency checks for files whose imports changed, and fires related/failed tests asynchronously for pull diagnostics and post-agent custom delivery. Reads the session-scan caches and surfaces them. **Secrets** (`gitleaks` + `trivy secret` + the ast-grep `*-hardcoded-secret-*` rules) are collapsed **by location** via `clients/secret-findings.ts` (`dedupeSecretFindings`) into a single 🔴 blocker with combined provenance (`[gitleaks + trivy + ast-grep]`) — the rule-keyed diagnostic dedup can't merge them since each source uses a different rule id; the duplicate ast-grep advisory copy is suppressed from the actionable-warnings report at the blocked locations (#131 Mode 3). Trivy **CRITICAL** CVEs are 🔴 blockers ("upgrade before shipping"); `govulncheck`/Trivy non-critical CVEs are advisories (FixedVersion as an upgrade hint — never auto-edits lockfiles). Trivy **license risk** (copyleft/restricted licenses, #131 Mode 4) is a 📜 advisory from the same `trivy fs --scanners vuln,secret,license` pass. Deduplicates findings against previous turn state and injects blockers (🔴) and advisories into the agent's context.
+**Turn worklist gate and fan-out bounds (#2504).** `turn_end`'s whole pipeline hangs off `Object.keys(turnState.files)`, so the WORKLIST is the load-bearing input: a wrong one turns a zero-tool-call turn into minutes of work. `clearTurnState` stamps the clearing owner (an ownerless `turn-state.json` used to be the resting shape, and the next session read it back as its own — 154 carried-over paths adopted as "modified this turn"), `getTurnStateAccess` evicts an ownerless worklist whose `lastUpdated` predates the asking session's `sessionStartedAt`, and an EMPTY worklist never latches a foreign writer out (nothing to protect — this is what keeps the owner stamp from locking the MCP route out of a just-cleared list). `addModifiedRange` rejects any path outside the PROJECT ROOT (`isTurnStatePathWithinRoot`, routed through `isUnderDir`): the worklist is a project worklist, and a scratchpad path in it becomes an LSP open and a test spawn. The containment root is a SEPARATE argument that defaults to `cwd` and is never the same thing as it — `cwd` still selects which `turn-state.json` the entry lands in. Judging containment against `cwd` was a review-round bug: `clients/lsp-mutation.ts` is handed a `cwd` that `tools/lsp-navigation.ts` scopes to the sub-package a call was issued from, while the LSP client's root spans the whole monorepo, so every server-initiated edit on a sibling package was dropped. That call site passes `runtime.projectRoot` — the same root `isRecordableProjectPath` is already given one frame up, so the two gates cannot disagree. The `turn_end: N file(s) modified` debug line carries the resolved `access:` and `owner:` — that pair is the one record that settles a wrong-worklist report from bytes. Both fan-outs off that list are bounded: the test batch through `runTestTargetsBounded` (concurrency 4, per-turn target cap, batch wall budget raced against the ambient abort signal, non-existent target files skipped before spawn — it used to fire 59 concurrent `vitest.cmd` spawns with only a per-target 60 s timeout), and `buildActionableWarningsReport`'s LSP enrichment by a project-root filter, a file cap and a wall budget, with the fresh-pull loop moved OFF the awaited hook (delivered through the same `actionable-warnings` cache) when the turn primed no LSP cache. Every truncation records a `recordDegradationOnce` — a capped batch is never a silently-partial green.
+
+**Deferred off-hook LSP work (#2504).** Moving the cold fresh-pull loop off the awaited hook creates work that outlives the turn that armed it, which is its own defect surface. Two rules. **Bounds:** the turn's `ctx.signal` is USELESS to it — `index.ts` clears the ambient slot in its `finally`, so a captured turn signal can never fire — and a wall deadline checked between files leaves a wedged `getDiagnostics` unbounded. `clients/deferred-lsp-work.ts` (a declared zero-dependency leaf, so `clients/lsp/index.ts` gains no import edge to the warning pipeline) owns ONE handle and ONE abort signal; `resetLSPService` fires it, before any teardown and before its no-live-service early return, which is how `session_shutdown`, `session_start` and the LSP idle reset all reach the loop through the single seam they already share. THE INCUMBENT HOLDS THE SLOT: arming returns `undefined` while an earlier deferral is still running, and that turn records its unchecked files instead of cancelling a loop that is about to publish. (Round 2 had arming abort the incumbent, which looked like tidy single-slot hygiene and was the opposite: a deferral is armed by a turn that primed NO LSP cache, i.e. every turn in a live editing session, so each arm cancelled its predecessor and an aborted loop publishes nothing by design — back-to-back editing turns delivered NOTHING. Declining cannot latch: registration releases the slot when the work settles, and the loop is bounded twice over.) `abortDeferredLspWork` still evicts unconditionally, so teardown is unaffected. Every round trip races a per-call timeout against that signal AND against whatever is left of the loop's wall budget, and the budget is re-read between a file's per-diagnostic `codeAction` pulls: a between-files-only check left ONE file free to spend an `openFile`, a `getDiagnostics` and up to `ACTIONABLE_WARNINGS_MAX_CODE_ACTIONS_PER_FILE` code-action round trips, 27 x the 10 s per-trip timeout, on the awaited hook after the batch budget was already gone (a 1 ms budget still cost 1012 ms). That per-file code-action cap is itself a bound with its own ledger entry, and the entry says the capped warnings were NOT reported: a capped diagnostic is skipped before its record exists, and an action-less record is dropped, so it never reaches the agent at all. The service is resolved ONCE per loop (re-resolving `getLSPService()` per file lets the loop re-spawn a server the idle reset just retired), no file is opened once the signal is up, and an aborted loop publishes nothing. An `openFile` whose bounded call loses to its timeout or the signal reports the file UNCHECKED and pulls nothing: `openFile` resolves `void`, so the success path must return a sentinel or the result is indistinguishable from a bound firing, and pulling anyway asks the server about a document it never received — the `[]` it answers is unknown, not clean (#240). **ONE publisher, and ordering is PER FILE, never per report.** `publishActionableWarningsReport` is the only thing that writes the `actionable-warnings` cache — `writeActionableWarningsReport` is private for exactly that reason — and it ALWAYS reads what is persisted, merges, then writes. Do not add a second writer. The in-band `turn_end` write used to be a blind overwrite sitting beside the deferred read-modify-write on the same key, and everything between arming a deferral and that write is awaited (cascade settle, knip, madge, the test batch, the in-band enrichment), so a deferred merge that landed mid-`handleTurnEnd` was erased 607 ms later and both halves' findings were gone. The merge is ASYMMETRIC by publish origin: a DEFERRED publish carries the older observation, so everything persisted is kept and its own entries upsert into it; an IN-BAND publish carries the newer one, so it publishes its own identity untouched and carries forward ONLY entries marked `origin: "deferred"`, clearing the marker as it does. That marker is the scope guard — carry everything and a report whose `scope` says `turn_delta` accumulates every earlier turn's findings; carry nothing and the blind-overwrite defect is back. The in-band carry-forward path requires EXACT equality between an entry's own `fileSeq` and the live `getFileSeq` for that file (not "the live seq has advanced past it") — an unmoved file's live seq always equals what was recorded; any mismatch, including a resumed process whose `_fileSeq` map was cleared and now reads 0 for a file a PRE-restart deferral had recorded at a nonzero seq, drops it (round 6, F1). Round 6 also removed a same-`sessionId` gate that used to sit beside that equality check, reasoning it added nothing past it. Round 7 (F4) restored it: the reasoning holds for the resume case (same session, seq reset) but not for a genuinely FOREIGN session whose entry happens to be stamped at `fileSeq` 0 too — `mcp/analyze.ts` and `mcp/session.ts` register modified ranges through their own `CacheManager` without ever bumping the extension runtime's `_fileSeq`, so an MCP-touched file can persist at seq 0 under a different `sessionId`, and `0 !== 0` reads FALSE. Equality and the `sessionId` gate now both have to hold for an in-band carry to survive — neither subsumes the other. A deferred report carries the ORIGINATING turn's `turnIndex`/`projectSeq` and may land many turns later: `mergeActionableWarningsReports` upserts each per-file entry whose `fileSeq` has not advanced (judged against the runtime's LIVE `getFileSeq` at write time — the persisted report lists only files that HAVE warnings, so a file edited into cleanliness is absent from it and would otherwise read as unchanged), unions the warnings through `mergeWarnings` where both halves hold the same file so a newer entry is never replaced by an older one, and drops ONLY the files that moved. Do not restore a whole-report ordering guard here. Round 3's replace-or-discard composed with incumbent-wins into "publish nothing": every `turn_end` with modified files persists an in-band report whose `turnIndex` strictly increases, and the decline fires exactly when such a turn runs while a loop is in flight — so a decline implied a supersede, always, and the declining turn's EMPTY placeholder out-ranked the incumbent's real findings on ordering alone. Publishing unconditionally is equally wrong: it overwrote turn N+1's report, `agent_end` then read `project_seq_mismatch` and silently skipped its autofix pass, and `lens_diagnostics` re-served the stale delta. Every report entry therefore carries its own `fileSeq` AND its own `generatedAt`; a merged report's `projectSeqEnd` is the MAX of its parts and each merged entry's stamp the OLDER of the two, and `applyDeltaFreshnessGate` ages each entry by its own stamp so the older half is never judged against the newer one. That per-entry stamp is the moment THAT FILE's pull returned, not the moment the report was assembled: `assembleReport` took one `new Date()` for every entry, which for a loop bounded at 25 files x ~880 ms made the first file's entry claim an observation ~21 s after the real one — and the freshness gate exists precisely to catch an edit made inside that window, so an over-late stamp hands it a window that has already closed. A file no LSP pull touched falls back to the moment the BUILD began, never later. Per-file loss is never silent — the ledger names the files dropped, and the decline's own reason states exactly what IS preserved (the incumbent's entries, merged) rather than asserting a preservation that did not happen.
+
 **Cached-blocker freshness gate (#1631).** A cached inline blocker is a verdict about its file *and everything that file imports*, yet every prior invalidation path keyed on the file alone — so when the cause was fixed in a dependency (especially out-of-band, where the dependency is never dispatched) the stale verdict re-served for the rest of the session (#1561's dependency-axis remainder, live instance). Before a cached blocking finding is re-served at turn end, `clients/blocker-freshness.ts` (`sweepInlineBlockerFreshness`) stats the file and its forward imports (resolved via the parse layer — no reverse-dependency index, so #1561's tests-free-index blocker does not apply) against the verdict's `recordedAtMs`; a drifted entry is DEMOTED, not dropped (#1419 demote-not-drop): `stale = true`, served out of the authoritative blocker channel as a `[stale — re-run to confirm]` advisory, and the gate never re-pulls the LSP itself (re-querying an LSP whose in-memory dependency document is itself stale would regenerate the stale verdict). The SAME gate lives at the widget-store cache layer (`reconcileStaleWidgetDependencyBlockers`, paired with `reconcileStaleWidgetFiles` at the `mode=all` read site) so `lens_diagnostics mode=all` cannot serve a blocking entry a same-minute `mode=full` sweep contradicts. One bounded `blocker_freshness_sweep` latency phase (plus `blocker_freshness_widget_gate` for `mode=all`) names the revalidated/kept/truncatedImports counts (`retired` was removed — the gate is architecturally demote-not-drop, so it never deletes an entry and the count would always read 0). `isBlocking` answers false for a stale finding, which is the single predicate both the footer tally and the mode=all blocking count consult. The full dependency-axis INVALIDATION (actively re-verifying consumers when a dependency dispatches clean) remains deferred to #1561. **Population gap (#1790).** The turn-end sweep's population was built solely from `RuntimeCoordinator`'s inline-blocker map — a live-dispatch-only store — so a blocking row a workspace-diagnostics CACHE HIT wrote straight into `widget-state.ts`'s `files` map (never touching the inline-blocker map) rendered in the widget while the sweep logged `total:1 kept:1` and never saw it. `sweepInlineBlockerFreshness` now accepts `options.additionalEntries`, populated by `runtime-turn.ts` from `widget-state.ts`'s `getWidgetBlockingFilesForSweep`, deduped by file path (`normalizeEphemeralMapKey` — cheap and consistent with the widget store's own key, not `normalizeMapKey`'s realpath/walk-up) against the inline-blocker map so a file present in both is drift-checked once. Review round 1 (#1790 F1) found the dedup DROPPING the widget row on a duplicate path: a live dispatch writes BOTH stores for one verdict, and `markInlineBlockerStale` only ever touches `RuntimeCoordinator`'s map, so the widget's own `isBlocking` for the file stayed true even after the inline entry demoted — the same ghost, one store over. A duplicated path now CHAINS the widget demote onto the inline entry's demote instead of discarding it: one drift check, both stores written. Review round 2 (#1790 F5) found the chain itself still ghost-prone: it fired even when the inline entry it chained onto was INELIGIBLE for the drift check (already latched `stale`, unstamped, or non-LSP/mixed sources) — the sweep's own gates short-circuit before ever calling `demote()` on those, so the chained widget demote silently never fired, either as a permanent forever-ghost (the stale latch never re-arms) or reappearing the instant an unrelated inline blocker shared the file. A duplicate now only chains when the inline entry is itself eligible (`isEligibleForDriftCheck`, the same three gates factored out so this can't drift from the real ones); an ineligible duplicate gives the widget row its own separate population entry, so a file can legitimately count twice when the two stores disagree on eligibility. The widget-origin write path is `markWidgetFileBlockersStale`, not `reconcileStaleWidgetDependencyBlockers` (that one stays mode=all-only) — same store, same demotion, different trigger, so this reuses the write rather than re-implementing it; a comment there pins the single-file-baseline assumption it depends on for a future writer. The two stores are injected rather than cross-imported because `widget-state.ts` already imports FROM `blocker-freshness.ts` (`collectForwardImportMtimes`); importing back would cycle.
 **Finding-delivery gate — single doc home (#1634).** Every store above (secrets, govulncheck, the cached-blocker gate) plus `lens_diagnostics` mode=full/all, the widget footer, agent nudges, and the persisted project-diagnostics snapshot are enumerated in `clients/finding-delivery-gate.ts`'s `DELIVERY_SURFACES` registry — the single place the freshness/dispositions/demotion-rendering contract is spelled out; every other file that gates or labels a finding points there instead of re-explaining it. Each surface is either `gated` (routes through `gateFindingsByPathFreshness`/`applyDispositions`/the blocker-freshness family above) or `labeled` (a package-pinned finding like a trivy CRITICAL CVE has no cited path to gate, so `formatCacheAgeLabel` states the session_start cache's age instead) — `assertNoDeliveryBypass()` rejects any registration that is neither, and `tests/clients/finding-delivery-gate.test.ts` ground-truths every entry's named gate/label call against its declared source file.
 
@@ -2001,7 +2550,7 @@ Holds: `filePath`, language-root `cwd`, `kind` (`FileKind` — `jsts`, `python`,
 - **`clients/lens-flag-registry.ts` is THE source of truth for every runtime toggle (#166) — add a flag there, nowhere else.** One `LensFlagSpec` per toggle (`name`, `description`, `configKey`, `negated`, `default`, `scope`, optional `env`/`readGlobal`) drives ALL FOUR consumers that used to keep their own list: `index.ts`'s `registerFlag` loop, `lens-config.ts`'s config parsing AND `resolvePiLensFlagWithSource` precedence chain, `project-lens-config.ts`'s nested closest-wins walk, and `tests/index-wiring.test.ts`'s registration contract. The module imports NOTHING, which is what lets both config loaders share `assignFlagConfigSection`/`readFlagConfigValue` without the import cycle that `config-enabled-shape.ts` was extracted to dodge (now deleted — the registry replaced it). How to apply: a new toggle is one array entry plus docs; do NOT add a `registerFlag` call, an if/else branch in the resolver, or a hand-parsed key in a loader. The invariant this enforces is that CLI and `config.json` coverage cannot diverge — the gap #166 reported was seven flags registered on the CLI that the resolver's if/else chain never matched, so `config.json` could never set them, and the wiring test that existed to catch exactly that had itself drifted (it was missing `lens-turn-summary`). `configKey` is a dotted path to a **boolean**, always in POSITIVE polarity (`lsp.enabled`, not `noLsp`); `negated: true` is how a `no-*` flag reads it. `scope: "project"` opts a flag into the `.pi-lens.json` tiers; `"global"` flags resolve env → cli → global → default. NON-boolean config keys (`dispatch.runnerTimeoutFloorMs`, `widget.visible`, `format.mode`, `actionableWarnings.autoFix.maxFixes`) are not flags and stay hand-parsed in `loadPiLensGlobalConfig` with a `getGlobal*` accessor beside the others — but they carry the same obligation: a key documented in `globalconfig.md` that no loader reads is the exact bug #166 fixed twice over (`maxFixes` was documented from #792 and silently unread until #166 wired it into `runtime-agent-end.ts`). When adding a documented key, grep for its reader before closing out.
 - **Project mutation controls are independent from diagnostics (#789/#792).** `.pi-lens.json` `format.enabled`, `autofix.enabled`, and `actionableWarnings.autoFix.enabled` (the three `scope: "project"` registry entries) resolve per edited file with closest-wins, per-flag inheritance from the file directory through the project root; explicit disabling CLI flags win, then the nearest defining project config, then global defaults. The shared upward walk is HOME-guarded and per-directory lookups are mtime-cached. Disabling any mutation path MUST NOT skip LSP synchronization, dispatch lint, actionable-warning reporting, or diagnostic publication.
 - **Scan exclusion + walk confinement are shared invariants — don't reinvent them per walker (#243/#250/#252/#253).** Any new filesystem walker MUST (1) route dir excludes through `isExcludedDirName` (`EXCLUDED_DIRS` in `file-utils.ts`) and path excludes through `getProjectIgnoreMatcher(root).isIgnored(...)` — NOT a private skip-list (a hardcoded set in the LSP workspace walk silently dropped users' `.pi-lens.json` `ignore` for months, #243); (2) **cap the walk-DOWN** with a `maxFiles` early-stop (source-filter `collectSourceFiles{,Async}`, warmup `collectSourceFilesForWarmup`=2000, review-graph `getGraphSourceFiles`=`maxGraphFiles+1` scoped to `MAIN_KIND_EXTENSIONS`, LSP workspace walk=5000); (3) for walk-**UP** project-root resolution, reject a marker at/above `$HOME` via `isAtOrAboveHomeDir(dir, homeDir?)` (`path-utils.ts`) — an exact `=== os.homedir()` check misses a marker found *above* `$HOME` (/home, C:\Users, fs root) and re-opens the #250 home-tree runaway. `resolveLanguageRootForFile` keeps its stricter workspace-relative check.
-- **`clients/workspace-topology.ts` — the preferred seam for per-directory MARKER discovery (#806), not just another walker.** Before hand-rolling "does this directory (or its nearest ancestor) contain file X" for a new marker, check whether `getWorkspaceTopology`'s shared index already covers it (`.pi-lens.json`/`pi-lens.json`, `tsconfig.json`, and the `workspace-modules.ts` manifest set — `package.json`, `pnpm-workspace.yaml`, `Cargo.toml`, `go.work`) or extend `getDirectoryMarkers` with a new marker rather than adding a private probe. `getDirectoryMarkers(dir)` collects ALL markers for a directory in ONE `readdir` pass, cached and mtime-invalidated per directory; `findNearestDirWithMarker` layers the shared `walkUpDirs` + `isAtOrAboveHomeDir` walk-UP discipline on top, capped at 64 climbs with a `workspace-topology-walk-cap` latency-phase log on trip (never a silent truncation, per the invariant above). `project-lens-config.ts`'s `findPiLensConfigInDir`, `tsconfig-paths.ts`'s governing-tsconfig lookup, and `workspace-modules.ts`'s `detectWorkspaceType` manifest-presence checks are migrated onto this index; each subsystem's OWN downstream cache (parsed config, matcher list, module graph) stays where it is — this module only indexes marker PRESENCE, not parsed content. `resetWorkspaceTopology()` is wired into `handleSessionStart` (`runtime-session.ts`) alongside `clearTsconfigPathsCache()`. **Root/language-root resolution (#807, second wave):** `language-profile.ts`'s `resolveLanguageRootForFile` now calls `findNearestDirWithAnyBasename(startDir, markers)` — the generalized, home-guarded/depth-capped/walk-cached counterpart of `findNearestDirWithMarker` for a per-call marker list rather than one of `DirectoryMarkers`' typed fields (each `DirectoryMarkers` entry also exposes a raw `entryNames` set from its single `readdir`, for exactly this kind of type-agnostic, non-typed-field presence check); `resolveLanguageRootForFile` itself is UNCHANGED policy-wise — it still clamps any found root back to `workspaceRoot` via its own stricter workspace-relative check, the topology service only supplies discovery. `startup-scan.ts`'s `findNearestProjectRoot` reads its per-directory marker presence through `getDirectoryMarkers(dir).entryNames` too, but keeps its OWN hand-written, NOT-home-guarded walk-UP loop — its callers need the actual marker location even when it resolves at/above `$HOME`, to tell the `"home-dir"` verdict apart from `"no-project-root"` (see its docstring and `startup-scan-home-ceiling.test.ts`); routing it through a home-guarded walker would silently turn `"home-dir"` into `"no-project-root"`.
+- **`clients/workspace-topology.ts` — the preferred seam for per-directory MARKER discovery (#806), not just another walker.** Before hand-rolling "does this directory (or its nearest ancestor) contain file X" for a new marker, check whether `getWorkspaceTopology`'s shared index already covers it (`.pi-lens.json`/`pi-lens.json`, `tsconfig.json`, and the `workspace-modules.ts` manifest set — `package.json`, `pnpm-workspace.yaml`, `Cargo.toml`, `go.work`) or extend `getDirectoryMarkers` with a new marker rather than adding a private probe. `getDirectoryMarkers(dir)` collects ALL markers for a directory in ONE `readdir` pass, cached and mtime-invalidated per directory; `findNearestDirWithMarker` layers the shared `walkUpDirs` + `isAtOrAboveHomeDir` walk-UP discipline on top, capped at 64 climbs with a `workspace-topology-walk-cap` latency-phase log on trip (never a silent truncation, per the invariant above). `project-lens-config.ts`'s `findPiLensConfigInDir`, `tsconfig-paths.ts`'s governing-tsconfig lookup, and `workspace-modules.ts`'s `detectWorkspaceType` manifest-presence checks are migrated onto this index; each subsystem's OWN downstream cache (parsed config, matcher list, module graph) stays where it is — this module only indexes marker PRESENCE, not parsed content. `resetWorkspaceTopology()` is wired into `handleSessionStart` (`runtime-session.ts`) alongside `clearTsconfigPathsCache()`. **`registerWorkspaceTopologyReset` is PUSH-ONLY — a compensating registered-or-fail sweep closes the gap (#2294, `tests/clients/workspace-topology-conformance.test.ts`):** the sweep is structural and IMPORT-scoped, not call-shaped: it parses actual import declarations through the existing ast-grep seam, resolves each specifier to the exact canonical source path, and enumerates every `clients/` module that BINDS a topology probe seam (`workspace-topology.js` for its probe exports — `getDirectoryMarkers`, `findNearestDirWithMarker`, `findNearestDirWithAnyBasename`, `findPiLensConfigMarkerInDir`, `findGoverningTsconfigDir`, `getWorkspaceManifestMarkers` — and `startup-scan.js` for `findNearestProjectRoot`) through a NAMED, ALIASED, multiline, or NAMESPACE import, and asserts each either calls `registerWorkspaceTopologyReset(` (registration DERIVED from source, never a copied list) or carries a documented freshness-key exemption. A named import counts even if the binding is never invoked (importing a seam is the act that can feed a memo); type-only and side-effect-only imports do not count; an unrelated same-name LOCAL function never does (a call-shaped detector both missed aliased imports and false-flagged those locals). When you add a module that memoizes a topology-derived result, register a downstream reset here; if it is stateless/per-call or self-invalidates (own retained reset or a file/path+mtime+size key), exempt it with the reason in that test's map instead. **Root/language-root resolution (#807, second wave):** `language-profile.ts`'s `resolveLanguageRootForFile` now calls `findNearestDirWithAnyBasename(startDir, markers)` — the generalized, home-guarded/depth-capped/walk-cached counterpart of `findNearestDirWithMarker` for a per-call marker list rather than one of `DirectoryMarkers`' typed fields (each `DirectoryMarkers` entry also exposes a raw `entryNames` set from its single `readdir`, for exactly this kind of type-agnostic, non-typed-field presence check); `resolveLanguageRootForFile` itself is UNCHANGED policy-wise — it still clamps any found root back to `workspaceRoot` via its own stricter workspace-relative check, the topology service only supplies discovery. `startup-scan.ts`'s `findNearestProjectRoot` reads its per-directory marker presence through `getDirectoryMarkers(dir).entryNames` too, but keeps its OWN hand-written, NOT-home-guarded walk-UP loop — its callers need the actual marker location even when it resolves at/above `$HOME`, to tell the `"home-dir"` verdict apart from `"no-project-root"` (see its docstring and `startup-scan-home-ceiling.test.ts`); routing it through a home-guarded walker would silently turn `"home-dir"` into `"no-project-root"`.
 - **`lens_diagnostics`/`pilens_diagnostics` `paths` scope restrictor (#461).** An optional `paths?: string[]` (max 200 entries, error not truncate) uniformly narrows all three modes to an explicit file/directory list — no new mode, no rejected combinations. delta/all: pure post-filter composed with the existing ignore predicate (`resolvePathsScope` in `tools/lens-diagnostics.ts`); an empty result under `paths` gets the honest "cached-only, use mode=full" note (mirroring the #190 carried-over note). full: an ACTIVE scan restricted to the list — `LSPService.runWorkspaceDiagnostics` grew a `files?: string[]` option that skips the whole-project walk (`clients/lsp/index.ts`), and `scanProjectDiagnostics` grew the same on `ProjectDiagnosticsScanOptions` (skips `collectSourceFilesAsync`); the cached heavyweight extractors (jscpd/madge/gitleaks/knip) and project snapshot stay cache-only post-filtered reads — never relaunched. A `files`-scoped `scanProjectDiagnostics` call deliberately does NOT persist its snapshot (would poison the cross-session cache with a partial view). Directory entries match as path-prefixes via the same predicate (no eager directory listing). Explicitly-listed files are NOT re-filtered through the project ignore matcher — matches `lsp_diagnostics`' `paths` param, which also takes explicit entries as-is (only its directory-walk mode applies the ignore matcher). Nonexistent entries (the git-staged-deleted-file case) are skipped silently for delta/all and noted in mode=full's output, never thrown.
 - **Diagnostic SURFACES — not just walkers — must filter `ignore` AND reconcile on-disk staleness (#279/#297/#298).** Excluding a file from the *walk* is necessary but not sufficient: anything that *displays* a recorded diagnostic re-checks both. (1) **Ignore on display:** `lens_diagnostics` delta/all/full filter through `createCurrentIgnoreFilter`→`getProjectIgnoreMatcher` (#279); **cascade** neighbor selection (`computeCascadeForFile`, `clients/dispatch/integration.ts`) filtered only by `isExternalOrVendorFile` and leaked a user-ignored neighbor's phantom diagnostics (#297 — editing `reader.ts` surfaced its ignored `reader.test.ts` importer's stale-view TS error), so BOTH the `sortedNeighbors` walk and `appendFallbackNeighbors` now also route through `isIgnoredCascadeNeighbor`→`getProjectIgnoreMatcher` (fail-open on a config-probe error). **The ignore matcher is only the ignored-file HALF of the cascade display policy; the test-ROLE half is #1080:** the review graph is tests-free, but collateral surfaces that re-derive neighbors from OTHER sources (LSP reference expansion, module-level downstream files, reverse-deps, the passive fallback) never saw that filter, so an UNIGNORED `*.test.*`/`tests/` neighbor could still leak. `clients/collateral-test-role.ts:isTestRoleCollateral` (composes `detectFileRole`, NOT a second matcher/private list; fail-open = RETAIN on a classifier throw) is applied at every collateral producer boundary: `computeCascadeForFile` filters `impact.directImporters`/`directCallers`/`neighborFiles` AFTER all appends (so the touch set, the returned `impact`, AND the `formatImpactCascade` header/counts are all clean — module-downstream files are caught HERE at consumption, deliberately NOT inside `computeImpactCascade`, so other query consumers stay unfiltered); `appendFallbackNeighbors`; the `runtime-turn.ts` call-graph advisory (filters `impact()` results before both the advisory text and the persisted delta); and `callGraphImpactToProjectDiagnostics`. It does NOT touch per-runner/auxiliary `skipTestFiles`, primary LSP diagnostics, or the generic snapshot/delta display (no blanket test-drop there). (2) **Staleness on display:** the in-memory widget has `reconcileStaleWidgetFiles` (per-ENTRY since #1186: drop each diagnostic whose own `observedAt` predates `mtimeMs`, keep the record while any survive, drop it only when empty — a merged record can hold a fresh preserved entry beside an aging cascade-snapshot entry, so a whole-record `mtimeMs > touchedAt` gate over-cleared; a finding-less clean record still gates on `touchedAt`), but the PERSISTED `project-diagnostics.json` snapshot (served by `lens_diagnostics mode=full refreshRunners=cached`) had NO equivalent — `loadProjectDiagnosticsSnapshot` validated only the cache `version`, replaying diagnostics for files the agent had since edited/deleted (#298 "cache needs cleaning"). `reconcileProjectDiagnosticsSnapshot` (`clients/project-diagnostics/cache.ts`) now drops a diagnostic when its file's `mtimeMs > scannedAt` (+1ms) or is gone, applied at the cached-full-mode consumer so `load…Snapshot` stays a pure reader (fail-safe: unparseable `scannedAt` → keep all). **Rule of thumb: a new diagnostic surface ⇒ ask "does it filter ignore?" AND "does it reconcile against current disk state?"**
 - **Tree-sitter symbol/import extractor (`tree-sitter-symbol-extractor.ts`, feeds the review graph) — two hard-won gotchas.** (1) web-tree-sitter 0.25 `Query.matches()` **does** apply `#match?`/`#eq?` predicates on the shipped grammars, so call/builtin-based import langs (ruby/zig/elixir/bash) use predicate-filtered queries directly. (2) All grammars load into ONE process-global WASM Module via the shared `treeSitterClient`; **lua parses to ERROR trees once a 2nd grammar loads** (external-scanner corruption — #255), silently breaking lua symbols+imports in multi-language repos. **When adding/validating a grammar query, exercise it under the fully-warmed shared client (the smoke tests do), not just a fresh client — a fresh-client probe passed while production was broken.**
@@ -2212,6 +2761,161 @@ The guard tracks more than the Read/Write/Edit tools. All of these register so a
 - **bash WRITES** (`extractWrittenPathsFromCommand`): `>`/`>>`/`N>`, `tee`, `sed -i`, `cp`/`mv` dest, `touch`. The agent authored the file, so — exactly like the Write tool — `noteCreatedFile` at tool_call + `recordWritten` at tool_result.
 - **search tools** (`clients/search-read-registration.ts` → `registerSearchReads`, ±2-line context margin): a tool exposes the lines it revealed via `details.searchReads: {file, startLine(1-based), endLine}[]`; `handleToolResult` consumes that for **any** tool and registers reads of only those lines (never the whole file). Populated by `ast_grep_search` (#169, done) and bash `grep -n`/`egrep`/`fgrep` (output parsed via `extractGrepSearchReadsFromOutput`). `ast_grep_search` also returns `details.matchLocations[]` with ready `readSlice` handles; keep those handles in sync with any formatter changes. `lsp_navigation` already populates `searchReads` for the location-revealing operations (definition/typeDefinition/declaration/references/implementation/workspaceSymbol/incoming+outgoingCalls via `collectSearchReadsForOperation`); `documentSymbol` deliberately does NOT (shape, not body — same rule as `module_report`). **Still remaining:** the pi built-in `grep`/`glob` tool (reveals an editable span — wire it for parity; `ls`/`glob`/`find` stay excluded as name-only). New producers only need to populate `details.searchReads` — no hook change.
 
+**MUTATION-CLASSIFICATION SEAM (#2423):** `classifyMutatingTool`
+(`clients/mutating-tool.ts`) is THE way to ask whether an inbound `tool_call` or
+`tool_result` mutates a file. Never compare `event.toolName` to `"write"` or
+`"edit"` at a call site — the whole edit-side chain (read-guard preflight → turn
+state → deferred queue → `agent_settled` drain) used to hang below fifteen
+independent literal comparisons, so a host or extension edit tool under any
+other name was dropped before the first bookkeeping call, with its path already
+resolved. The seam answers with a `kind` (`write` or `edit`), a `provenance`
+(`builtin`, `bash-derived`, `declared`, `bridge`, plus `observed`, `learned` and
+`settled-sweep` from the #2430 net below), and any lines a shape adapter
+resolved. It recognizes pi's built-ins from a table and a third-party tool from
+its INPUT SHAPE through the ordered `MUTATION_SHAPE_ADAPTERS` registry, where
+the first non-`undefined` result wins. A new mutating-tool shape is a new
+adapter entry with its own `source` discriminator in the
+`touched_lines_detected` / `edit_preflight_blocked` telemetry, never a new name
+check. An edit-shaped tool the seam cannot place defaults to the DEFERRED
+autofix pass, the safe timing, and its changes get their own
+`agent-tool:<name>` change source rather than being folded onto `agent-edit`.
+The write-side counterpart of the read bridge is `clients/mutation-bridge.ts`:
+an in-process producer that writes a file outside the tool-event path calls
+`recordMutation` at `Symbol.for("pi-lens:mutation-bridge")` and gets the same
+bookkeeping; `ast_grep_replace apply:true` is the in-repo consumer. The entry
+carries three optional producer-stated fields the seam otherwise cannot infer:
+`importsChanged` (gates the madge re-scan filter, default `false` — the safe
+prior behavior every existing producer keeps), `deferAutofix` (queues a
+deferred autofix/format pass at `agent_settled`, default `true`) and
+`provenance` (the #2430 net's `"observed"`/`"settled-sweep"`, default
+`"bridge"`). A second in-repo consumer, `clients/lsp-mutation.ts`'s
+`bookkeepLspMutation`, calls the bridge as ITS OWN internal fallback (never a
+parallel seam other code reaches for) when its own caller could not thread
+`runtime`/`cacheManager` — it passes the real `importsChanged` value and
+`deferAutofix: false`, since the LSP direct path never defers a format pass
+either (#2450).
+
+**`noteMutationHandled` is not gated on `deferAutofix` (#2465).** Inside
+`recordMutationThroughSeam` the `noteMutationHandled(filePath)` call sits
+BEFORE — outside — the `if (entry.deferAutofix !== false)` guard, and
+`bookkeepLspMutation`'s DIRECT branch calls it too, right after
+`cacheManager.addModifiedRange`. "pi-lens accounted for this write" and
+"pi-lens will format this file later" are different questions: an LSP-applied
+edit answers yes to the first and no to the second. Fold either one into the
+other and the `agent_settled` sweep re-reads every `lsp_navigation` rename and
+every `workspace/applyEdit` fallback write as drift no tool call explains —
+the exact false report the net exists to avoid.
+
+**OBSERVATIONAL MUTATION NET (#2430):** the name table and the shape registry
+are finite and the population of third-party edit tools is not, so a fourth
+tier WATCHES. When `classifyMutatingTool` returns `undefined` for a call whose
+input still carries a path-shaped field, `clients/observed-mutation.ts` takes a
+bounded pre-snapshot and diffs it at the `tool_result`; whatever changed is
+replayed through the mutation bridge as `kind: "edit"` with `provenance:
+"observed"` and `editRanges` derived from the read-guard's stored per-line
+hashes. **The observation universe is the TARGET PATH ALONE** — that path's
+file, or, when it is a directory, that directory's own entries non-recursively
+and capped. Never siblings, never the tracked set: watching the neighbourhood
+attributed a background write to whatever tool happened to be running, so a
+`read`-shaped tool got learned as an editor from one coincidence. The tracked
+set is the SETTLED SWEEP's domain, and only its. When the directory cap BITES
+the universe is a TRUNCATION, so an empty diff over it is `unverifiable` and
+never clean — scoring the truncation as clean de-attributed a real codemod that
+rewrote the 84th entry of an 84-entry directory.
+
+`clients/mutation-attribution.ts` remembers the tool: `provenance: "learned"`
+for the session on the first observation, persisted under
+`getProjectDataDir(cwd)` on the second — and a session-learned tool STAYS armed
+until that second observation lands, because nothing else can produce it (latch
+off at observation one and the persist threshold is unreachable). A
+still-armed-and-already-classified tool is recorded by exactly ONE of the two
+paths: **when the settle replayed, the classification chain skips**, or the same
+physical edit lands in the change log twice (once with measured ranges, once
+whole-file). Three CONSECUTIVE clean observations withdraw a provisional
+attribution again, and withdrawing resets BOTH counters — leaving the clean
+count at three made the withdrawal terminal, so the tool was never armed again
+and could never be re-learned. An observation the net could not COMPLETE is
+`unverifiable`: it neither spends the arm latch nor votes in the
+de-attribution run. One `unclassified-mutating-tool` degradation per tool keeps
+the registry gap visible; a truncated directory watch adds an
+`observed-mutation-dir-cap` tally naming the tool.
+
+A tool that names no file is caught by the `agent_settled` sweep, which runs
+BEFORE the deferred drain and re-baselines after it so pi-lens's own formatter
+output is never read as third-party drift. The sweep is INCREMENTAL and
+**stat-first**: it stats a bounded window of the tracked set per turn from a
+carried cursor and reads a file only when its size or mtime moved, so coverage
+of a large tracked set accumulates across turns instead of timing out in one,
+and the record reports its own `scanned`/`notReachedThisPass`/`cursor`. Two rules there
+are not negotiable — **never replay on size+mtime alone** (a `touch` moves mtime
+without moving a byte, so a candidate is confirmed by content hash or named in
+`unverifiable`), and **never trust the stat short-circuit against a baseline
+recorded while the file's mtime was still fresh** (`LedgerEntry.seenAtMs`
+against `OBSERVED_LEDGER_SETTLE_MS`, the same-tick same-size rewrite of catalog
+shape 6). That comparison goes through `clients/freshness.ts`, like every other
+mtime-against-a-recorded-instant question in `clients/` (#1739). A file pi-lens
+has never seen has no baseline and is not covered, by design. The post-drain
+re-baseline retires the "pi-lens wrote these bytes" mark **per FILE**, not
+all-or-nothing: a mark drops exactly when the ledger has been moved onto that
+file's post-drain bytes (`rebaseline` inside `scanTrackedIncrementally`), so an
+aborted or truncated pass still clears the marks for the files it reached and
+correctly leaves the rest standing. Two earlier shapes both cost a fabricated
+mutation — clearing the whole set unconditionally (including on an abort)
+replayed pi-lens's own formatter output as third-party drift, and clearing only
+on a *complete* pass suppressed a genuine third-party change to an
+already-covered file until some later pass happened to finish. Its traversal is
+`handled` itself — the files THIS run's pipeline or drain actually wrote (see
+`noteMutationHandled`) — not the tracked set: every file the refresh needs to
+re-baseline is, by construction, already in `handled`, so walking it is
+O(handful) regardless of how large the tracked set is, and (barring an abort or
+a genuinely pathological handled-set size) completes in one pass every time.
+Walking `getTrackedPaths()` instead was the earlier shape, and it coupled this
+function's completion to the tracked-set size: `report: false` always starts
+its cursor at 0, so a tracked set too large to finish inside
+`OBSERVED_CAPTURE_BUDGET_MS` parked at the SAME prefix every turn and a mark
+past that prefix never retired, permanently suppressing drift reports for it
+(#2449 review round 5, F2/PROBE-B1).
+
+`deriveObservedEditRanges` reports ranges only when it can MEASURE them: a
+windowed read-guard baseline, a changed line count, an unreadable file or a
+spent read budget all return `undefined` so the bridge over-approximates to the
+whole file. Naming lines that were never touched is worse than naming none.
+
+Do not add a second scanner: the snapshot and diff primitives are
+`captureFileStatsForPaths` / `diffFileStats` in
+`clients/opaque-mutation-scan.ts`, shared with the #2000 bash recovery so the
+paths cannot disagree about what "changed" means. There is no synchronous twin
+any more, and adding one back is not the answer to an ordering problem. Every
+capture carries a timeout AND an abort race, a file cap, a hash-byte budget and
+a per-turn wall-clock budget; exceeding any of them writes a bounded record and
+a degradation-ledger tally, never a silent skip. The SETTLE is the deliberate
+exception to the BUDGET only: it has its own deadline rather than the arm's
+leftovers, because a settle clamped to a spent budget drops a mutation that was
+already measured. It is ASYNC, and the #1086 ordering contract is met at the
+CALL SITE instead: the pending-baseline probe (`hasPendingObservation`) is
+synchronous, and `handleToolResult` reads everything it derives from the
+post-result bytes — the state hash the in-flight composite key is built from —
+BEFORE the settle's yield. Move that read after the yield and a racing
+tool_result for the same path collapses two distinct pipelines into one.
+Steady-state cost is zero for a classified `write`/`edit` (the net is gated on
+`classifyMutatingTool` having returned `undefined` or the attribution still
+being provisional) and ~1.3ms for one armed observation of a file target, paid
+at most a handful of times per tool name per session.
+
+`tests/clients/mutating-tool-classification.test.ts` greps `clients/`, `tools/`
+and `index.ts` and fails when a mutation decision reappears outside the seam —
+`===`/`!==`/`==`/`!=` against `"write"`/`"edit"`/`"multiedit"` (any
+`…toolName`-shaped operand), an `isToolCallEventType` call, a `switch` over an
+expression ending in `.toolName`, a literal `["write", "edit"]`-style set with
+`.includes(`/`.has(`, and a local aliased from `<expr>.toolName` and compared to
+those literals later in the SAME file. Cross-file aliasing and helper-laundered
+comparisons are the guard's known blind spot; review covers those.
+Anchor resolution for `pi-hashline-edit-pro` (`clients/hashline-anchor.ts`)
+answers ONLY for a line whose canonical content occurs once in the file: the
+extension serves store-carried anchors (`mapStableHashes`), so a duplicate-line
+anchor otherwise resolves to a confident WRONG line and the guard acts on the
+wrong range. Unresolved is always a report, never a block.
+
 **PATH-KEY INVARIANT (hard-won — #210):** `ReadGuard` keys its `reads`/`edits`/`exemptions`/`pendingCreations`/`writtenThisSession` maps through `normalizeFilePath` (private `key()`), never the raw path. Read sources arrive with mixed separators/casing — the Read tool gives OS-native backslashes on Windows; search/LSP reads arrive slash-normalized from URIs — and `resolveToolCallFilePath` returns absolute paths verbatim. Keying on the raw string made a read recorded under one form invisible to an edit checked under another → false `zero_read` block despite the file having been read. **Any new map access MUST key through `key()`, and any new read-guard test MUST exercise cross-separator paths** (record one form, check the other) — same-form-on-both-sides is exactly what let #210 ship. Guarded by `tests/clients/read-guard-path-normalization.test.ts`.
 
 ## Dependencies & install constraints (hard-won — see #167-area fixes)
@@ -2298,6 +3002,8 @@ seq/hash/range validation → atomic apply → read-guard stamp → seq/change-l
 
 Use it first for partial apply, then LSP workspace edits/actionable autofix. It must not bypass read guard for normal agent edits, replace oldText autopatch, guess stale ranges, or apply project-wide edits by default.
 
+**Partial apply consumes preflight-approved spans, never re-searches (#2402).** `resolveOldTextEdits` (`clients/read-guard-tool-lines.ts`) resolves each oldText against one snapshot and carries `EditSnapshotIdentity` (raw-byte hash) plus exact `spanStart`/`spanEnd` offsets and the approved `appliedSpanText` on every `PartiallyApplicableEdit`. Every accepted normalization tier must map to a raw span; otherwise the whole batch closes without a partial write. `applyPartiallyApplicableEdits` (`clients/partial-edit-apply.ts`) validates the WHOLE batch before any write — snapshot hash re-checked under `FileTime.withLock`, span text, pairwise non-overlap — and rejects stale/overlapping input with a structured rejection and zero disk/sequence/pipeline effects. The commit routes through the shared `writeFileAtomic` seam (the file graduated out of `EXEMPT_RAW_WRITE_FILES`), applied bottom-up from the snapshot's LF view; it follows a leaf symlink and passes the existing mode to the atomic staging file. A committed write and a post-edit analysis failure are separate outcomes: the composed block reason leads with the committed indexes (`composePartialApplyReason`), never with the preflight 🔄/🛑 header, so committed bytes are never re-labelled as a retryable oldText miss. Every applied pair — partial-apply commits AND successful native edits (`runtime-tool-result.ts` records them at `tool_result`) — lands in `RuntimeCoordinator.partialApplyRecords` (bounded per-file/per-store, `normalizeMapKey`, cleared in `resetForSession`) as a fixed-size exact-pair digest plus the complete post-commit file hash. Before declaring an oldText miss, the preflight consults that record with `isExactAppliedRetry`: session provenance and unchanged file content must agree, and the check never falls back to a global newText-present heuristic. Only then does an identical retry answer `✅ ALREADY APPLIED` instead of escalating or re-executing the write.
+
 Workspace edits (`clients/lsp/edits.ts`) are strict and confined: shape/URI/resource preconditions, document versions, text bounds, and all text reads are preflighted before mutation; only an unexpected filesystem failure after that preflight retains the documented no-rollback boundary. Incoming server positions are normalized from the negotiated encoding against the same virtual post-resource content/path model used by application, so ordered rename/create/delete followed by descendant text edits works before destinations exist on disk; a failed range remains fail-closed. Rename notification state preserves the original opened URI plus its authority/encoding spelling for the destination; a failed `didClose` aborts/resynchronizes instead of sending `didRenameFiles`. `rename_file` validates both resource paths and preconditions through a read-only call to this same apply/confinement seam before soliciting any `willRenameFiles` edits (including previews), then routes its disk resource operation back through the seam (never a direct mkdir/rename). Preflight lazily maps renamed directory descendants and tracks subtree tombstones so ordered edits after rename/delete chains cannot resurrect deleted children without walking the whole tree. Mutation telemetry describes normalized edits; each solicited request gets one bounded, sequence-tagged summary under its outer correlation ID, with an explicit aggregate overflow marker after the 100-summary cap.
 
 The preflight's virtual model has a THIRD layer beyond `virtual` (physical-path-keyed) and the tombstone/move lists: `virtualOverrides` (#1085 P3-3), keyed on the raw, unresolved query path, for a `create` whose target is a path currently shadowed by an earlier rename's vacated "from" address in the SAME ordered edit — `resolveVirtualPath` correctly returns `undefined` there (no physical address to key `virtual` on), so a later op at that exact path (e.g. a trailing text edit) would otherwise see it as still-nonexistent. A case-only (or otherwise-aliased) rename's alias decision also has TWO tiers now (#1085 P3-8): a fast, disk-free check that the destination's and source's cached `VirtualFile` object are referentially identical (proof they share a case-folded map key — i.e. a virtual-only entry, e.g. one `create`d earlier in the same edit and not yet written to disk), falling back to the physical `isSameFsEntry` `lstat`-identity probe untouched for genuinely-physical paths. `mergeWorkspaceTextEditsByPriority`'s exact-duplicate dedup (used on the `renameFile` merge path) only applies to non-empty ranges — zero-width inserts keep their multiplicity even when duplicated within one server's own edit, matching `validateTextEdits`'s invariant on the normal apply path. A queued text document `version: null` (LSP 3.17: "don't check") never conflicts with a numeric version for the same URI; the numeric one is adopted and still checked against the live document version. `fileDetails[].importsChanged` on a text edit means "this edit changed an import/re-export-from line" (pre/post signature comparison), not "the file contains any import" — `create`/`rename`/`delete` keep their existing conservative (trivially-correct or structural) flags.
@@ -2318,11 +3024,11 @@ A 2026 audit against `@earendil-works/pi-coding-agent` confirmed a few places wh
 
 - **Project-diagnostics extractor registry (#179)** — the heavyweight project analyzers are normalized into `ProjectDiagnostic` records and surfaced via `lens_diagnostics` full mode. `clients/project-diagnostics/extractors.ts` is the single registry: each row maps an analyzer's **cached** result (by cache key) to per-file diagnostics via a pure `runner-adapters/*` function. **Cache-only — `mode=full` reads the caches and folds them in, it NEVER launches a scan** (so it can't relaunch or contend with the background session-start/turn-end runs, which share a global abort signal). **Done:** knip, jscpd (clone → both ends), madge (cycle → each file), gitleaks (secrets → blocking), govulncheck (reachable Go CVE → first traced source frame), trivy (dep CVE → manifest), dead-code (vulture/Python; unlisted → blocking), opengrep (CLI scan, #584; `ERROR` severity → blocking). **Not (cleanly) adaptable — left out on purpose:** type-coverage (wired but currently never run/cached — no cache to read), test-runner (caches a formatted string, not structured findings), call-graph (structural intelligence, not diagnostics). Adding an adaptable one is one adapter + one registry row — no `formatFullMode` surgery.
 
-- **LSP server `initializationOptions` overrides via project config** — `clients/lsp/config.ts` now also parses a `serverOverrides` key in `.pi-lens/lsp.json` (or `.pi-lens.json` / `pi-lsp.json`). Each entry is keyed by the built-in server `id` (e.g. `"rust"`, `"nix"`) and carries an `initializationOptions` object. In `clients/lsp/index.ts` `spawnClient()`, the override is fetched via `getServerInitOverride(server.id, filePath)` and deep-merged (user wins on conflicts) onto the server's built-in defaults via `mergeInitializationOptions`. Arrays are replaced, not merged (consistent with standard LSP settings merge semantics). Tests live in `tests/clients/lsp/server-init-overrides.test.ts`. Test files that mock `clients/lsp/config.js` must include `getServerInitOverride: vi.fn().mockReturnValue(undefined)` in the mock factory — existing service tests (`service-touch-collect`, `service-race`, `service-early-unblock`, `service-mode-grace`, `workspace-diagnostics-per-server`, `runtime-session-warm`) were updated accordingly.
+- **LSP server `initializationOptions` overrides via project config** — `clients/lsp/config.ts` projects a `serverOverrides` key out of the `lsp` namespace of the canonical config files (see "Package scope" above and `docs/configuration.md`; the legacy locations still resolve for their deprecation window). Each entry is keyed by the built-in server `id` (e.g. `"rust"`, `"nix"`) and carries an `initializationOptions` object. In `clients/lsp/index.ts` `spawnClient()`, the override is fetched via `getServerInitOverride(server.id, filePath)` and deep-merged (user wins on conflicts) onto the server's built-in defaults via `mergeInitializationOptions`. Arrays are replaced, not merged (consistent with standard LSP settings merge semantics). Tests live in `tests/clients/lsp/server-init-overrides.test.ts`. Test files that mock `clients/lsp/config.js` must include `getServerInitOverride: vi.fn().mockReturnValue(undefined)` in the mock factory — existing service tests (`service-touch-collect`, `service-race`, `service-early-unblock`, `service-mode-grace`, `workspace-diagnostics-per-server`, `runtime-session-warm`) were updated accordingly.
 
-- **LSP server preference via project config** — `clients/lsp/config.ts` supports `.pi-lens/lsp.json` with `disabledServers` and custom server entries, but there is no way to express a *preference* between built-in candidates (e.g. prefer `basedpyright` over `pyright` when both are installed). `PythonServer.spawn()` currently uses first-found-wins ordering (`pyright-langserver` before `basedpyright-langserver`, then a local-only `ty server` (#717) before pyright's managed/auto-install tier). A future `preferredServer` key in `LSPConfig` should let projects override this ordering; the server policy layer (`clients/lsp/server-policy.ts`) is the right place to apply the preference before candidate resolution.
+- **LSP server preference via project config** — the `lsp` namespace supports `disabledServers` and custom server entries, but there is no way to express a *preference* between built-in candidates (e.g. prefer `basedpyright` over `pyright` when both are installed). `PythonServer.spawn()` uses first-found-wins ordering: project-environment and Node-local `pyright-langserver`, then `basedpyright-langserver`, then project-environment or PATH `ty server` (#717), then pyright's managed-install tier. A future `preferredServer` key in `LSPConfig` should let projects override this ordering; the server policy layer (`clients/lsp/server-policy.ts`) is the right place to apply the preference before candidate resolution.
 
-- **ty as an alternative Python LSP (#717)** — `PythonServer.spawn()` (`clients/lsp/server.ts`) tries a bare `ty server` on PATH after the local pyright/basedpyright candidates fail and before pyright's managed-install fallback. Deliberately **not** added to the installer registry (`clients/installer/index.ts`) / `ensureTool`, and `allowInstall` is hardcoded `false` for that call — ty is PATH-only-discovered so it stays strictly opt-in (a user who installs `ty` themselves gets it as a lighter local alternative) and never becomes the auto-installed Python LSP default, which stays pyright. ty's CLI shape differs from pyright/basedpyright's `--stdio` (it's `ty server`, no flag), so it needs its own `resolveAndLaunch` call rather than joining the `localCandidates` array. No `initializationOptions` are sent — ty has no stable `pythonPath`-equivalent init option yet (astral-sh/ty#2032) and auto-discovers `.venv`/`VIRTUAL_ENV` from `cwd` instead.
+- **Python project environments apply without shell activation (#717, closes #2407, refs #1513)** — `clients/python-environment.ts` resolves `VIRTUAL_ENV`, `CONDA_PREFIX`, `.venv`, or `venv` without invoking a package manager. It supplies a child-only `PATH` and `VIRTUAL_ENV` to Python LSP, standalone Pyright, and pytest processes; never mutate `process.env`, because different roots can select different environments. `PythonServer.spawn()` prefers project-environment pyright/basedpyright/ty binaries before broader candidates. `TestRunnerClient` runs pytest through the detected project interpreter itself and uses generic `python -m pytest` only when no project environment exists. ty stays opt-in: it is not in the installer registry, and its `resolveAndLaunch` call keeps `allowInstall:false`, so managed pyright remains the default when the project and PATH provide no Python LSP. No `initializationOptions` are sent to ty because it has no stable `pythonPath` equivalent (astral-sh/ty#2032); its child environment and cwd drive interpreter discovery.
 
 - **Toolchain-gated LSP auto-install (#241, partially shipped)** — `ensureTool` only covers servers in the installer registry (npm/pip/gem + single-binary github/maven/archive). `allowInstall:false` / `PI_LENS_DISABLE_LSP_INSTALL=1` means **discovery-only, not no-discovery**: `ensureTool(id, { allowInstall:false })` must still probe PATH/npm-global/managed-bin and skip only the install step; `forceReinstall` must not bypass that gate, and in-flight ensures are keyed by install policy so discovery-only callers never inherit a concurrent install. LSP spawn `undefined` while installs are disabled is an expected unavailable state, not a broken server signal — cool it down briefly, but don't count it toward permanent session disablement. Root-detector glob markers are supported (`*.csproj`, `*.sln`, `*.cabal`, etc.); use globs for real project-file names rather than pseudo-extension markers like `.csproj`. Heavy workspace servers must not use `FileDirRoot` fallback just to keep spawning: C# (`csharp-ls`/OmniSharp) now resolves `*.sln`/`*.csproj` and skips standalone `.cs` files, matching Rust's no-manifest skip (#201); F# (`fsautocomplete`) does the same for `*.sln`/`*.fsproj`. The verifiable slice is DONE (`clients/lsp/server.ts`): **fsautocomplete** now installs via `dotnet tool install` (`runtimeInstall` hook + `dotnetToolCandidates` discovery, mirroring csharp-ls), and **gopls / rust-analyzer** gained canonical-bin discovery — `goBinCandidates`/`cargoBinCandidates` add `$GOPATH/bin` (or `~/go/bin`) and `$CARGO_HOME/bin` (or `~/.cargo/bin`) as candidates so a runtime-managed binary resolves (and gopls's post-`go install` retry lands) even when those dirs aren't on PATH. Because `shouldAllowInstall` defaults on, the smoke spawn drives `runtimeInstall` directly — these are live-smoke-able (`scripts/smoke-tools.mjs --lsp fsharp go rust`) and unit-smoked deterministically (`tests/clients/lsp/runtime-install-discovery.test.ts` — reject-all candidate capture, `allowInstall:false` so no real installs fire). STILL on the PATH-only `createInteractiveServer` path (deferred, unverifiable on the Win dev box): ocamllsp (opam), nixd (nix), haskell-language-server (ghcup version-matching), sourcekit-lsp (Swift toolchain, discovery-only). Archive-tree servers (jdtls, kotlin-language-server, clangd, lua-language-server, elixir-ls) needed a platform-matched archive strategy — the GENERIC archive-TREE-bundle shape EXISTS (#278): `ArchiveSpec` supports `stripComponents`/optional `launcher`/`treeMarker`, `installArchiveTool` keeps the whole extracted tree and resolves to the extract dir. **Two launch shapes now ride on it:** (A) *runtime + bootstrap script* via `resolveAndLaunchBundle` (a runtime on PATH drives a script inside the tree, graceful-skip when runtime/bundle absent) — first consumer **PowerShellServer** (PSES = `pwsh Start-EditorServices.ps1 -Stdio`); (B) *self-contained bin-in-tree* via `resolveAndLaunchTreeBinary` (PATH candidates first, else the managed bundle, then launch `<bundle>/bin/<exe>[.exe]` directly — no external runtime) — first consumer **clangd** (#241, `CppServer`, id "cpp"; `stripComponents:1` drops the `clangd_<ver>/` wrapper, `treeMarker:"bin"`). clangd also added the **platform-matched archive URL**: `ArchiveSpec.url` accepts a `(platform, arch) => url | undefined` resolver (`resolveArchiveUrl` drives `installArchiveTool`, degrading to "unavailable" where no build exists; plain string still works) — the reusable bit lua-language-server (next; also exercises per-*arch*) / kotlin / elixir-ls consume. Shape (C) *launcher-script-in-tree needing an ambient JVM/BEAM toolchain* (kotlin/elixir-ls) is still TODO. (clojure-lsp + gleam ARE registered too — single native binaries.)
 
@@ -2478,6 +3184,8 @@ Rules live in `rules/ast-grep-rules/rules/*.yml` (plus the multi-rule `rules/ast
 
 **TS/JS rule twins have two execution surfaces.** The ast-grep CLI/LSP language-gates by `language:`, so a `language: TypeScript` rule does **not** cover standalone `.js` files in the shipped ast-grep LSP baseline; user-facing TS/JS rules that should fire in JS usually need a `-js` twin with `language: JavaScript` and its own fixture. The in-process `ast-grep-napi.ts` fallback is different: it skips only rules whose `language:` is *neither* TypeScript nor JavaScript, parses each target file with its OWN grammar (`.ts`→ts, `.js`→js), and runs every remaining TS/JS rule. A grammar-agnostic twin can therefore duplicate in fallback mode, while a grammar-divergent twin is still required (canonical example: `no-flag-argument`, where a default parameter is `required_parameter` in TS and `assignment_pattern` in JS). When changing this policy, fix fallback dedup/normalization explicitly rather than relying on CLI behavior. Full authoring guidance: the `pi-lens-write-ast-grep-rule` skill.
 
+**HTML embedded-`<script>` coverage (#2347) is part of the napi fallback's contract.** The ast-grep CLI/LSP (verified against 0.45.1) resolves every HTML `<script>` body as JavaScript and runs `language: JavaScript` rules inside it; the napi fallback must match, because under Gate B it substitutes for that LSP. `evaluateAstGrepRules` (the shared seam the per-edit runner and the project scanner both call) reparses each `script_element` body with the addon's `js` grammar and runs JS rules there, translating findings back to file coordinates. The translation stays in ONE unit: `@ast-grep/napi`'s `Pos.index`/`column` are UTF-16 code-unit offsets, so the line-start table is built from the JS string, never from UTF-8 bytes — a byte table shifts every coordinate after a multibyte character. Injection is UNCONDITIONAL — `type` and `src` do not suppress it (the CLI behaves that way); `type="text/template"` and `type="application/json"` bodies are scanned all the same. Only `language: JavaScript` rules enter scripts: TS/TSX and CSS rules keep the file-mismatch filter, matching the CLI (a `.ts` twin never fires on script content). `<style>` bodies are NOT injected (0.45.1 does not, verified) — that is an accepted divergence, recorded in `clients/lsp/server.ts`'s ast-grep comment. Callers of `evaluateAstGrepRules` that want HTML embedded coverage must pass the file `content` and the loaded `sgModule`; without them an HTML file's JS rules stay mismatch-skipped, and the `astgrep_napi_unsupported_rules_skipped` record carries `htmlInlineScriptCount` on HTML entries so "no injection target" stays countable. The evaluation is budget-bounded (`MAX_SCRIPT_BODIES_EVALUATED` + `MAX_SCRIPT_BODY_BYTES_EVALUATED`, applied before any grammar parse to EVERY body, first one included) because the work is `rules * bodies * body-size`; a generated page with thousands of `<script>` tags — or one ~1 MiB dense inline body — otherwise stalls the per-edit hook for seconds (a single oversized first body measured 19.5 s before the caps bound it too). Every silent failure mode and the budget cut emits a bounded, discriminating degradation record (kinds `ast-grep-napi-html-*` in the ledger; subjects are the file path) so "no embedded findings" stays distinguishable from "coverage was dropped". Adding an ast-grep embedded content axis to one route means adding it to both.
+
 **Cross-validation against the upstream playground:** `scripts/playground-verify-rule.mjs` is a headless-CDP tool that loads a rule and a `--code` fixture into the official [ast-grep playground](https://ast-grep.github.io/playground.html) and reports the match count the playground's own engine produces against that fixture. This is a *second opinion* against the local CLI test — useful for catching both pattern-level drift between the version of `ast-grep` pinned in `package.json` and the version the upstream binary ships, and rule-vs-source disagreements. (#2208: earlier versions wrote `--code` into the playground's Pattern-mode-only `query` field instead of `source`, so every run silently graded the playground's own hardcoded sample instead of the fixture — every "ok:true" was a smoke test that the rule loaded, not evidence the fixture matched. Fixed; see `docs/astplayground.md` for the field split and the scrape sentinel that now catches a recurrence.) See `docs/astplayground.md` for the architecture, limitations, and CLI surface.
 
 - **Native napi engine (#206).** The runner matches every rule through napi's own engine — `root.findAll({rule, constraints})` — fed by a faithful `js-yaml` parse (`parseSimpleYaml` is a thin `js-yaml` wrapper). The old hand-rolled YAML parser + ~240-line interpreter and the `ast-grep-native-rules` flag are **gone**. The full grammar works: nested `any`/`all`/`has`, `inside`/`follows`/`precedes`, `field`, `nthChild`, and metavariable `constraints`. A rule napi rejects is skipped (never partially evaluated).
@@ -2570,8 +3278,12 @@ values to lowercase before ANY comparison — the corpus mixes case across
 nearly every language (111 `TypeScript` vs 31 `typescript`, 47 `Python` vs
 52 `python`, ...), so a raw-case comparison is wrong somewhere on every
 language, not just HTML. Runtime lowercases (sgconfig.ts, ast-grep-napi.ts);
-tooling that compares raw is the recurring gap — #2331 tracks the two known
-sites. (#2325)
+tooling that compares raw is the recurring gap — #2331's one real member was
+the catalog overlap key (fixed with a missing-field guard); the audit script
+has normalized at its parse site since #657, a review false positive corrected
+in #2339's record. Keep the corpus's mixed-case tags intact and normalize at each tooling
+comparison site rather than rewriting source data; regression coverage must
+pin that boundary. (#2325, #2331)
 
 A target repository that supplies its own `sgconfig.yml` / `sgconfig.yaml` at the workspace root takes precedence — pi-lens respects the project config instead of injecting its baseline.
 
@@ -2625,7 +3337,7 @@ evadable by construction, so its exception map records intentional non-sweeps.
 - New tool parameters → tool-level routing tests verifying the parameter reaches the right handler.
 - Bug fixes → a regression test that would have caught the bug.
 - Run `npm test` (or `npm run build && npm test` if `.js` artifacts may be stale) and confirm all tests pass before committing.
-- **Also run `npm run lint` before pushing — especially for test-file changes.** `npm run lint` (`tsc -p tsconfig.json`) is the strict CI gate and type-checks the `tests/` tree; `npm run build` (`tsconfig.build.json`) **excludes tests** and `build:dist` uses `--noCheck`, so a type error in a test compiles clean locally but fails CI lint. (This has bitten us — build passing ≠ lint passing.)
+- **Also run `npm run lint` before pushing — especially for test-file changes.** `npm run lint` (`tsc -p tsconfig.json && npm run lint:js`) is the strict CI gate: `tsc` type-checks the `tests/` tree, and `lint:js` (oxlint, `--deny-warnings`) covers plain `.mjs`/`.cjs`/`.js` and, since #2454, the production TypeScript tree (`clients/`, `tools/`, `mcp/`, root `index.ts` — `tests/**` TS stays ignored, tracked by #2462); `npm run build` (`tsconfig.build.json`) **excludes tests** and `build:dist` uses `--noCheck`, so a type error in a test compiles clean locally but fails CI lint. (This has bitten us — build passing ≠ lint passing.)
 - **Assert telemetry against real sinks, not logger mocks (#1742 direction).** When a test must verify that a log/telemetry record was emitted, prefer reading the REAL emitted bytes — `await flushLatencyLog()` then read `path.join(getGlobalPiLensDir(), "latency.log")` from the worker's hermetic `PI_LENS_HOME` — over `vi.mock`-ing the logger module. Module mocks of loggers both re-introduce the instance-binding hazards the shared-writer registry exists to remove and assert against an imaginary surface; the real file is the same bytes a smell analyzer or human reads post-merge. If the logger no-ops under vitest (test-mode guard), the sanctioned opt-out is scoping `PI_LENS_TEST_MODE=0` to the single test that needs real writes.
 - **Adding an LSP server → add a smoke fixture, or the drift guard fails.** Registering a server in `LSP_SERVERS` does NOT automatically smoke-test it: the runner-level `smoke-fixture-coverage.test.ts` blanket-exempts the single `lsp` runner. `tests/clients/lsp/lsp-fixture-coverage.test.ts` is the SERVER-level guard — it fails unless every non-auxiliary server routes to an `LSP_FIXTURES` entry in `scripts/smoke-tools.mjs` (a fixture file whose extension resolves to it) and every auxiliary server is attached via a fixture's `auxiliaryServerIds`. Only the share-an-extension ALTERNATES (deno/python-jedi/omnisharp/expert) are exempt. The nightly `tool-smoke.yml` runs `--lsp --install` over the WHOLE list, so a self-contained github/npm server is then covered automatically (toolchain-gated ones — pwsh/.NET/go/rust — need the runner to provision the toolchain). `LspFixture` is typed in `scripts/smoke-tools.d.mts`.
 
@@ -2689,6 +3401,7 @@ Mock the **environment** (tool presence, network, abort/error injection) — nev
 - Cache round-trip coverage needs two runs against the same env (`makeRealRunnerEnv` + two `addFile`s) and an explicit cold-then-warm assertion on `queries_loaded.cacheHit`; behavior assertions alone also pass if the cache always misses. This split is exactly where the #448 `skip_test_files`-dropped-on-cache-hit bug hid.
 - Tree-sitter real-runner suites may mock `recordEntitySnapshotDiff` to return no changes. That seam is unrelated post-query enrichment and otherwise launches detached review-graph work past Vitest teardown. Keep the parser, query loader, matching, and dispatch filters real.
 - The LSP runner's real-dispatch coverage lives in `lsp-real-runner.test.ts`: it registers the stdio fake server from `tests/fixtures/fake-lsp-server.mjs` as a workspace custom server for a test-only extension, then exercises the production `LSPService` and runner with `makeRealRunnerEnv`. Keep server launch/protocol, diagnostics, conversion, and code-action fetching real; environment setup (custom config and binary-presence skip) is the only test seam.
+- Real-wire workspace-pull tests reuse `tests/fixtures/fake-lsp-server.mjs`. Enable `FAKE_LSP_WORKSPACE_DIAGNOSTICS`, then program its response URI, delay, or JSON-RPC error with the matching `FAKE_LSP_WORKSPACE_DIAGNOSTIC_*` variables; do not create a second protocol server.
 - Mocked control-flow tests (availability gates, error paths) stay legitimate and complement the above; so do the ~20 CLI runner tests that mock `safeSpawnAsync` — the seam there is an external binary, with real coverage in the nightly `tool-smoke.yml`.
 
 ## Commit conventions
@@ -2752,6 +3465,66 @@ Keep the records bounded, use the existing log conventions, and exclude zero-dur
 
 Verified workspace-root guesses for a missing tool-call attribution are benign host behavior: count them in `clients/path-attribution-telemetry.ts` and emit one `path_attribution_verified_rollup` row at session shutdown. Keep non-existent or otherwise unverified guesses as full `path_attribution_missing` records with `rawFilePath` and `guessedPath`; this uses the session-rollup shape from `clients/bus-events-logger.ts`, not the degradation ledger.
 
+The session-state registry uses `sessionStartClosureReset` when a reset must
+run in `index.ts`'s `session_start` closure instead of the
+`handleSessionStart` call graph. `sessionStartClosureResetNames()` derives
+direct reset calls at that site and excludes nested or deferred callback bodies;
+the registry checks this derived set rather than a copied list. Keep resets for
+process-singleton session state behind the concurrent-secondary decision. The
+primary activation owns the tally, and a secondary must never clear it.
+
+`tests/support/session-state-scan.ts`'s container detector recognises a
+module-level `const`/`let` bound to `new <Ctor>(...)` where `<Ctor>` is a
+built-in (`Map`/`Set`/`WeakMap`/`WeakSet`) or ANY class declared anywhere in
+`clients/`, regardless of export shape (`export class`, `export default
+class`, `export abstract class`, a bare non-exported `class` later re-exported
+via `export { A }` / `export { A as B }`), scanned live once per run instead
+of hand-listed. #2442's `BoundedFifoMap`/`BoundedLruCache` migration had to be
+added to a hard-coded alternation by hand before the scan could see it again;
+#2455 fix round 1 replaced the alternation with a live scan gated on the class
+owning a `clear()`/`delete()` method (directly or through an `extends`
+chain) — round 2 found that gate was ITSELF a miss: `FactStore`'s own clear
+methods are named `clearAll`/`deleteFileFact`, not `clear`/`delete`, so two of
+its five production module-scope instances (`dispatch/integration.ts`,
+`mcp/analyze.ts`) stayed invisible. Round 2 dropped the method-name gate for
+the issue's own primary wording — "declared in `clients/`" — which also
+deleted the `extends`-chain walk and its cycle guard (nothing left to resolve
+without a method filter). A class that structurally qualifies but is proven
+NOT to hold session state gets a documented `CONTAINER_CLASS_EXCLUSIONS`
+entry rather than a special case at the call site — empty today; both a stale
+entry (names a class the live scan no longer finds) and a reason-less entry
+red via `auditContainerClassExclusions()`. Known boundaries the predicate
+still cannot see (`SWEEP_HEURISTIC_LIMITS`): a `new` bound to a constructor
+IMPORTED from outside `clients/` (a node_modules class), or built via a
+factory function instead of a bare `new Ctor(...)` call. The declaration may
+carry an `export` prefix (round 4) — it could not before, which made
+`export const goClient = new GoClient()` invisible for no reason but the
+keyword in front of it.
+
+**The container predicate is not the gate that decides what the sweep looks
+at.** `scanSessionStateCandidates` skips a file outright when it exports no
+reset (`if (resets.length === 0) continue`), so widening the predicate can
+only ever surface state in files that ALREADY have a reset seam. A file
+holding session state with no reset at all stays invisible however wide the
+predicate gets — MISS 3, "state with no reset seam at all", and no #2455
+round touched it. `go-client.ts` and `rust-client.ts` are the worked example:
+their `GoClient`/`RustClient` latches were found by HAND while auditing what
+the widening should have covered, and the files only entered the sweep once
+#2455 added `resetGoAvailability`/`resetRustAvailability`. Read a widened
+predicate as "the registry now describes more of what it already watches",
+never as "the sweep now finds unreset state".
+
+**A reset is only as total as the instance count behind it.** #2455 round 2
+added those two resets against the runner-module singletons while
+`bootstrap.ts` separately constructed its own `GoClient`/`RustClient` for
+`BootstrapClients`, which is what `handleSessionStart` reads for its "Active
+tools" line — so the reset re-armed a latch nothing user-visible consulted and
+the bug survived its own fix (round 4, F2). A per-session reset over a
+process-lived latch is wrong unless there is exactly ONE instance of that
+latch; put the instance in the module that owns the class, beside the reset,
+and let every consumer import it. `tests/clients/toolchain-client-singleton.test.ts`
+is the ratchet for the toolchain clients.
+
 ## Issue triage & labels
 
 Every issue should carry **one TYPE label + at least one `area:` label**.
@@ -2794,6 +3567,7 @@ derived eager-import set.
 - `lens_diagnostic_mark` (#690, `tools/lens-diagnostic-mark.ts` + `clients/diagnostic-dispositions.ts` + `clients/dispatch/suppress-writer.ts`) is an agent-facing disposition layer over dispatch diagnostics: `false-positive` / `suppress` (writes an inline `pi-lens-ignore` comment) / `defer` (session-only, in-memory) / `flagged` (persists, tagged `📌 flagged-to-fix` in `lens_diagnostics mode=full`). Content-anchored with per-disposition binding strength — `false-positive` uses a STRICT anchor (rule+message+the flagged line's own content hash, so a rewritten line gets a fresh chance to re-fire); `suppress`/`defer`/`flagged` use a WEAK anchor (rule+message only, no line hash) so the mark survives incidental edits elsewhere on that line. Wired into both the per-edit dispatch path (`dispatcher.ts`) and the `mode=full` sweep (`lens-diagnostics.ts`). Every mark is NDJSON-logged (`clients/disposition-logger.ts` → `~/.pi-lens/dispositions.log`, incl. `previousDisposition` on re-marks and in-memory-only `defer` marks — the #181 rule-tuning signal, especially `false-positive` rates per rule) and published on the bus as `pilens:diagnostic:disposition` (`clients/disposition-publish.ts`, sibling producer per the format-events-publish "owns nothing in common" rule; emitter wired in index.ts alongside the other three), both from the single `markDisposition` choke point. pi-lens-internal only — situational, NOT mirrored into the MCP server (MCP has no equivalent tool; would need its own engine seam + tool route if that gap gets closed).
 - `ast_grep_outline` (#311, `tools/ast-grep-outline.ts` → `AstGrepClient.outline` → `ast-grep outline --json=compact`) is a SYNTAX-ONLY structure tool (no index/LSP); `module_report` stays the pi-lens-aware default. pi tool only — not mirrored to MCP (parity deferred, like `read_enclosing`).
 - `clients/runtime-config.ts` is "pure constants" by intent. Resolutions that read disk or env (e.g. `getRunnerTimeoutFloorMs`) must be **lazy memoized getters** with a `_resetForTests` hook, not module-level reads, so importing the file has no I/O side effect and tests can override inputs deterministically.
+- **`clients/language-registry.ts` is THE language-identity source (#2424).** One entry per language — stable `LanguageId`, extensions, exact filenames, the coarse `FileKind` it maps onto, the LSP `languageId` and the tree-sitter grammar name — and every extension-or-token → language-name table under `clients/` AND `tools/` is a projection of it: `lsp/language.ts`'s `LANGUAGE_EXTENSIONS`, `tree-sitter-shared.ts`'s `EXT_TO_LANG`, `project-diagnostics/scanner.ts`'s `TREE_SITTER_EXT_TO_LANG`, `read-expansion.ts`'s `readExpansionLanguage`, `lens-engine.ts`'s symbol_search `lang` filter (via `extensionsForLanguageToken`), the kind-keyed answer `review-graph/builder.ts` + `module-report.ts` share via `symbolExtractionGrammar`, and `tools/lsp-diagnostics.ts`'s directory-scan mode (via `SCAN_LANGUAGE_PRIORITY` + `extensionsForLanguage`, #2434 — the last table #2424 deliberately left out, because its OLD ordered iteration picked which language a mixed directory scanned as; the registry now owns that order too, explicit and drift-tested rather than an ad hoc table, with the handful of reconciled extension-set widenings/narrowings pinned in `tests/clients/language-registry-drift.test.ts`'s `SCAN_LANGUAGE_PRIORITY` describe block). That claim is grep-verifiable: `rg -n 'EXT_TO_LANG|EXTENSION_TO_|LANG_EXTENSIONS|LANGUAGE_EXTENSIONS|_TO_GRAMMAR|GRAMMAR_TO_|LANG_TO_' clients/ tools/` returns only the registry and the projections that still spell a table name (plus `tree-sitter-client.ts`/`tree-sitter-symbol-extractor.ts`, which only CONSUME `LANGUAGE_TO_GRAMMAR`; `lens-engine.ts` no longer matches because it imports `extensionsForLanguageToken`), and `grammar-source.ts`'s `LANGUAGE_TO_GRAMMAR` (grammar → wasm filename, a different question, drift-tested for reachability from the registry). Adding or re-spelling a language means editing the registry, never a call site: a per-consumer column is justified ONLY when that consumer's PROTOCOL demands a different token (the LSP spec's `typescriptreact`/`shellscript`/`jsonc`, the wasm's `tsx`/`bash`), which is what the `lspId` and `grammar` columns are for. `FileKind` stays deliberately coarse (`jsts`, `cxx`) and is a column here, not a synonym for the id. `LanguageId` is type-linked to `PINNED_LANGUAGE_IDS` in both directions (`satisfies` + `LANGUAGE_ID_PIN_IS_EXHAUSTIVE`), so adding a union member without a pin entry fails `npm run build` and adding a pin entry without a registry entry fails the drift test. `tests/clients/language-registry-drift.test.ts` also fails on a hand-edited projection, an extension or exact filename owned by two entries, a grammar wasm no entry reaches, or an unexplained row in the golden snapshot `tests/fixtures/language-identity-snapshot.json` (regenerate with `node scripts/gen-language-snapshot.mjs`); `tests/clients/lsp-capable-seam-coverage.test.ts` pins the LSP-facing half — including "maps every lspCapable kind's extensions to an LSP language id", which is the guard that replaced #1545's runtime per-kind `??=` fill-in when the registry made it dead.
 - **Project-wide extension enumeration derives from `KIND_EXTENSIONS`** (#894). `ALL_SCANNABLE_EXTENSIONS`, `WARMUP_SOURCE_EXTS`, and `SUPPORTED_FILE_KINDS` must never regain hand-maintained per-language lists; adding a file kind in `clients/file-kinds.ts` automatically makes source scans and language-profile warmup see it. Preserve consumer-specific narrowing with an explicit `extensions` override at that call site, not by narrowing the shared defaults.
 - **Skill docs (`skills/*/SKILL.md`, `reference.md`) are prose, not type-checked source, so they drift silently** (#1423/#1424: a stale `filePath` param name, a missing `php` tree-sitter language dir). `tests/skills/skill-doc-drift.test.ts` pins them against the real sources of truth instead of relying on manual review: tool-call param names/tables against each tool's real TypeBox schema (imported live from `tools/*.ts`), path references against the filesystem and `package.json`'s published `files` (unpublished dirs — `clients`, `tests`, `tools`, `scripts` — require a nearby "source checkout only" qualifier), and both rule-writing skills' language lists against their `rule-schema.json` enums. A load-bearing behavioral claim in a skill doc should carry a `<!-- verified: <ref>, <shortSHA> -->` comment (format pinned by the same test) so a future edit can tell a checked claim from an assumed one.
 - Codebase-model file selection uses `detectFileRole`, `isBuildArtifact`, and `isExternalOrVendorFile`; generated-artifact directory names (including `dist`) are maintained in `clients/generated-artifacts.ts`, not reimplemented as model-local substring tests. Persisted models carry the canonical review-graph identity and `CODEBASE_MODEL_VERSION`; load rejects either mismatch.

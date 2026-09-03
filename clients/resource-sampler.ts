@@ -25,11 +25,11 @@
  * **synchronously in that detached callback**, which no `try { await pidusage }
  * catch {}` at the call site can catch → uncaughtException → the pi host
  * crashes (#620, #533). pidusage 4.0.1 exposes no option to avoid the gwmi
- * path. So on Windows this module runs its OWN fully guarded
- * `Get-CimInstance Win32_Process` query (see `sampleProcessesWindows`),
- * mirroring `findDescendantPidsWindows`'s guard pattern, and computes CPU%
- * from the same KernelModeTime/UserModeTime delta-over-elapsed formula gwmi
- * uses — so a spawn failure can only ever lose a data point, never throw.
+ * path. So on Windows this module asks the shared, fully guarded process-table
+ * seam (`clients/process-snapshot.ts` over `scripts/lib/process-scan.mjs`,
+ * #2443) for the CPU/RSS columns instead, and computes CPU% from the same
+ * KernelModeTime/UserModeTime delta-over-elapsed formula gwmi uses — so a
+ * spawn failure can only ever lose a data point, never throw.
  *
  * Every export here is best-effort: a sampling failure (pid already exited,
  * `pidusage` throwing, permission denied, etc.) must never throw into the
@@ -44,11 +44,10 @@
  * clients/instance-reaper.ts (`decideOrphanReaping` vs `sweepOrphans`).
  */
 
-import * as path from "node:path";
 import pidusage from "pidusage";
-import { spawnCollectStdoutResult } from "./child-unref.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { terminateScannerChild } from "./instance-reaper.js";
+import { queryProcessTable } from "./process-snapshot.js";
 
 export const RESOURCE_SAMPLE_QUERY_TIMEOUT_MS = 2_000;
 
@@ -131,30 +130,17 @@ async function findDescendantPidsWindows(
 ): Promise<number[] | null> {
 	if (!runningOnWindows() || !Number.isFinite(rootPid) || rootPid <= 0)
 		return [];
-	// One WQL query pulls every process's (pid, parentPid) pair; walk the BFS
-	// in JS rather than issuing N queries for N tree levels.
-	const psScript =
-		"Get-CimInstance Win32_Process " +
-		"| Select-Object -Property ProcessId,ParentProcessId " +
-		'| ForEach-Object { "$($_.ProcessId),$($_.ParentProcessId)" }';
-	const powershell = path.join(
-		process.env.SystemRoot ?? String.raw`C:\Windows`,
-		"WindowsPowerShell",
-		"v1.0",
-		"powershell.exe",
-	);
-	// Fire-and-forget, per-poll-tick spawn (#1155): `spawnCollectStdout` unrefs
-	// the child AND its piped stdout so this one-shot CIM query can never keep
-	// a settled `pi --print` process alive past its own close — mirrors the
-	// reaper's identical spawn→collect plumbing (#1153/#1160). Sampling still
-	// works normally in an interactive/long-lived session: unref only means
-	// "don't hold the loop open FOR this alone," the collected stdout is still
-	// delivered whenever `close` fires. The result status keeps a failed query
-	// distinct from a successful empty process table.
-	const result = await spawnCollectStdoutResult(
-		powershell,
-		["-NoProfile", "-NonInteractive", "-Command", psScript],
-		{ shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+	// One query pulls every process's (pid, parentPid) pair; walk the BFS in
+	// JS rather than issuing N queries for N tree levels. The listing itself is
+	// the shared seam (#2443), which also supplies the fire-and-forget spawn
+	// rails this call has always needed (#1155): the child AND its piped stdout
+	// are unref'd, so this one-shot query can never keep a settled
+	// `pi --print` process alive past its own close, and a scanner child that
+	// blows the timeout is tree-killed and verified rather than abandoned. The
+	// result status keeps a failed query distinct from a successful empty
+	// process table.
+	const result = await queryProcessTable(
+		{ fields: ["pid", "ppid"] },
 		{
 			timeoutMs: RESOURCE_SAMPLE_QUERY_TIMEOUT_MS,
 			onTimeout: (child) => terminateScannerChild(child, {}),
@@ -168,17 +154,11 @@ async function findDescendantPidsWindows(
 		);
 		return null;
 	}
-	const pairs: Array<[number, number]> = [];
-	for (const line of result.stdout.split(/\r?\n/)) {
-		const [pidStr, ppidStr] = line.split(",");
-		const pid = Number(pidStr);
-		const ppid = Number(ppidStr);
-		if (Number.isFinite(pid) && Number.isFinite(ppid)) {
-			pairs.push([pid, ppid]);
-		}
-	}
 
-	return walkDescendantPids(rootPid, pairs);
+	return walkDescendantPids(
+		rootPid,
+		result.rows.map((row) => [row.pid, row.ppid] as [number, number]),
+	);
 }
 
 /**
@@ -191,11 +171,13 @@ async function findDescendantPidsWindows(
  * without bound as pids come and go.
  */
 interface WindowsCpuHistoryEntry {
+	processIdentity: string;
 	cpuMs: number;
 	ts: number;
 }
-const windowsCpuHistory = new Map<number, WindowsCpuHistoryEntry>();
+const windowsCpuHistory = new Map<string, WindowsCpuHistoryEntry>();
 const CPU_HISTORY_MAX_AGE_MS = 60_000;
+const CPU_HISTORY_MAX_ENTRIES = 4_096;
 
 /**
  * TEST-ONLY: clear the Windows CPU%-history so a test's two-sample CPU%
@@ -206,19 +188,33 @@ export function __resetWindowsCpuHistoryForTests(): void {
 	windowsCpuHistory.clear();
 }
 
+export function __windowsCpuHistorySizeForTests(): number {
+	return windowsCpuHistory.size;
+}
+
+export function __windowsCpuHistoryHasForTests(
+	pid: number,
+	processIdentity: string,
+): boolean {
+	return windowsCpuHistory.has(`${pid}:${processIdentity}`);
+}
+
 /**
- * Windows-only CPU%/RSS sampling via a FULLY GUARDED `Get-CimInstance
- * Win32_Process` query (mirrors `findDescendantPidsWindows`): a synchronous
- * throw from `spawn` (the `spawn UNKNOWN` crash vector, #620), a `child`
- * `error` event, or a non-zero/garbage exit all resolve to an errored/absent
- * map — this function can NEVER throw or reject. Deliberately does NOT call
- * `pidusage`, whose unguarded internal `gwmi` spawn is the crash we're fixing.
+ * Windows-only CPU%/RSS sampling through the FULLY GUARDED process-table
+ * seam (mirrors `findDescendantPidsWindows`): a synchronous throw from
+ * `spawn` (the `spawn UNKNOWN` crash vector, #620), a `child` `error` event,
+ * or a non-zero/garbage exit all resolve to an errored/absent map — this
+ * function can NEVER throw or reject. Deliberately does NOT call `pidusage`,
+ * whose unguarded internal `gwmi` spawn is the crash we're fixing.
  *
- * RSS comes from `WorkingSetSize`; CPU% from `KernelModeTime`+`UserModeTime`
- * (both in 100 ns units → ms via `/1e4`) differenced against this pid's prior
- * sample over the elapsed wall time — the same computation pidusage's gwmi
- * path uses. The first time a pid is seen it has no prior sample, so CPU% is
- * reported as 0 for that tick and a real rate lands on the next one.
+ * RSS comes from `WorkingSetSize` (`rssBytes`); CPU% from `KernelModeTime`
+ * plus `UserModeTime` (both in 100 ns units → ms via `/1e4`) differenced
+ * against this pid's prior sample over the elapsed wall time — the same
+ * computation pidusage's gwmi path uses. The first time a pid is seen it has
+ * no prior sample, so CPU% is reported as 0 for that tick and a real rate
+ * lands on the next one. The process creation date (`startedAt`) is the
+ * pid-reuse discriminator: a recycled pid must not inherit the previous
+ * process's CPU baseline.
  */
 async function sampleProcessesWindows(
 	valid: number[],
@@ -226,33 +222,26 @@ async function sampleProcessesWindows(
 	const samples = new Map<number, ProcessUsage>();
 	if (valid.length === 0) return samples;
 
-	// pids are pre-validated finite positive integers, so this WQL filter is
-	// injection-safe. One line per pid: "pid,workingSet,kernel100ns,user100ns".
-	const filter = valid.map((p) => `ProcessId=${p}`).join(" or ");
-	const psScript =
-		`Get-CimInstance Win32_Process -Filter "${filter}" ` +
-		"| Select-Object -Property ProcessId,WorkingSetSize,KernelModeTime,UserModeTime " +
-		'| ForEach-Object { "$($_.ProcessId),$($_.WorkingSetSize),$($_.KernelModeTime),$($_.UserModeTime)" }';
-
-	const powershell = path.join(
-		process.env.SystemRoot ?? String.raw`C:\Windows`,
-		"WindowsPowerShell",
-		"v1.0",
-		"powershell.exe",
-	);
-	// Fire-and-forget, per-poll-tick spawn (#1155): `spawnCollectStdout` unrefs
-	// the child AND its piped stdout so this one-shot CIM query can never keep
-	// a settled `pi --print` process alive past its own close — mirrors the
-	// reaper's identical spawn→collect plumbing (#1153/#1160). It also absorbs
-	// both failure modes this function used to guard inline — a synchronous
-	// `spawn` throw (the `spawn UNKNOWN` crash vector, #620) and an async
-	// `error` event, or a non-zero exit — the result status keeps failure distinct
-	// map. Sampling still works normally in an interactive/long-lived
-	// session: unref only means "don't hold the loop open FOR this alone."
-	const query = await spawnCollectStdoutResult(
-		powershell,
-		["-NoProfile", "-NonInteractive", "-Command", psScript],
-		{ shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+	// pids are pre-validated finite positive integers, and the seam validates
+	// them again before they reach the query text, so the filter is
+	// injection-safe. The seam also supplies the fire-and-forget spawn rails
+	// (#1155: the child and its piped stdout are unref'd, so this one-shot
+	// query cannot keep a settled `pi --print` alive past its own close) and
+	// absorbs every failure mode this function used to guard inline — a
+	// synchronous `spawn` throw (the `spawn UNKNOWN` crash vector, #620), an
+	// async `error` event, a timeout, or a non-zero exit — reporting each
+	// through `status` rather than as an indistinguishable empty table.
+	const query = await queryProcessTable(
+		{
+			fields: [
+				"pid",
+				"rssBytes",
+				"cpuKernel100ns",
+				"cpuUser100ns",
+				"startedAt",
+			],
+			filter: { column: "ProcessId", op: "eq", values: valid },
+		},
 		{
 			timeoutMs: RESOURCE_SAMPLE_QUERY_TIMEOUT_MS,
 			onTimeout: (child) => terminateScannerChild(child, {}),
@@ -265,18 +254,42 @@ async function sampleProcessesWindows(
 	try {
 		const now = Date.now();
 		const seen = new Set<number>();
-		for (const line of query.stdout.split(/\r?\n/)) {
-			const parts = line.split(",");
-			if (parts.length < 4) continue;
-			const pid = Number(parts[0]);
-			const workingSet = Number(parts[1]);
-			const kernel100ns = Number(parts[2]);
-			const user100ns = Number(parts[3]);
-			if (!Number.isFinite(pid) || pid <= 0) continue;
-			if (!Number.isFinite(workingSet)) continue;
+		for (const row of query.rows) {
+			const pid = row.pid;
+			const workingSet = row.rssBytes;
+			const kernel100ns = row.cpuKernel100ns;
+			const user100ns = row.cpuUser100ns;
+			const processIdentity = row.startedAt ?? "";
+			// The seam already rejects a non-integer or negative column as
+			// UNKNOWN (undefined), so an absent value here means the row cannot
+			// be sampled — never that the process used zero.
+			if (
+				workingSet === undefined ||
+				kernel100ns === undefined ||
+				user100ns === undefined ||
+				processIdentity.length === 0
+			)
+				continue;
 
 			const cpuMs = Math.round(kernel100ns / 1e4) + Math.round(user100ns / 1e4);
-			const prev = windowsCpuHistory.get(pid);
+			const historyKey = `${pid}:${processIdentity}`;
+			// A reused PID must start a fresh rate window. Drop every prior identity
+			// for this PID before looking up the current one.
+			for (const [key, prior] of windowsCpuHistory) {
+				if (
+					prior.processIdentity !== processIdentity &&
+					key.startsWith(`${pid}:`)
+				) {
+					windowsCpuHistory.delete(key);
+				}
+			}
+			const prev = windowsCpuHistory.get(historyKey);
+			if (prev && cpuMs < prev.cpuMs) {
+				// A counter reset is not a flat sample. Retire the baseline so the
+				// next valid observation starts a new rate window.
+				windowsCpuHistory.delete(historyKey);
+				continue;
+			}
 			let cpuPercent = 0;
 			if (prev) {
 				const wallMs = now - prev.ts;
@@ -285,15 +298,28 @@ async function sampleProcessesWindows(
 					if (!Number.isFinite(cpuPercent) || cpuPercent < 0) cpuPercent = 0;
 				}
 			}
-			windowsCpuHistory.set(pid, { cpuMs, ts: now });
+			windowsCpuHistory.set(historyKey, { processIdentity, cpuMs, ts: now });
 			seen.add(pid);
 			samples.set(pid, { rssBytes: workingSet, cpuPercent });
 		}
 		// Prune stale history so pids that have gone away don't accumulate.
-		for (const [pid, entry] of windowsCpuHistory) {
+		for (const [key, entry] of windowsCpuHistory) {
+			const pid = Number(key.slice(0, key.indexOf(":")));
 			if (!seen.has(pid) && now - entry.ts > CPU_HISTORY_MAX_AGE_MS) {
-				windowsCpuHistory.delete(pid);
+				windowsCpuHistory.delete(key);
 			}
+		}
+		while (windowsCpuHistory.size > CPU_HISTORY_MAX_ENTRIES) {
+			let oldestKey: string | undefined;
+			let oldestTs = Number.POSITIVE_INFINITY;
+			for (const [key, entry] of windowsCpuHistory) {
+				if (entry.ts < oldestTs) {
+					oldestKey = key;
+					oldestTs = entry.ts;
+				}
+			}
+			if (oldestKey === undefined) break;
+			windowsCpuHistory.delete(oldestKey);
 		}
 	} catch {
 		// Parsing must never throw into the caller; best-effort.
@@ -328,6 +354,13 @@ export async function sampleProcesses(
 		for (const pid of valid) {
 			const stat = stats[String(pid)];
 			if (!stat) continue; // pidusage couldn't resolve this pid — leave absent
+			if (
+				!Number.isFinite(stat.cpu) ||
+				stat.cpu < 0 ||
+				!Number.isFinite(stat.memory) ||
+				stat.memory < 0
+			)
+				continue;
 			result.set(pid, {
 				rssBytes: stat.memory,
 				cpuPercent: stat.cpu,
@@ -414,6 +447,97 @@ export interface SpawnUsageSummary {
  * (or one that re-execs itself) is actually captured. POSIX spawns are
  * unwrapped (`shell: false`), so `pid` there is already the real tool.
  */
+export interface ProcessTreeCpuSample {
+	/** True when the process tree burned CPU above the liveness floor. */
+	busy: boolean;
+	/** True when at least one CPU sample resolved (a real measurement). */
+	measured: boolean;
+	/** Highest summed CPU% across pid + descendants, or null when unmeasurable. */
+	cpuPercent: number | null;
+}
+
+/**
+ * #2358: sample a live process tree twice across a short window and answer
+ * whether it burned CPU above `floorPercent`.
+ *
+ * The notify-stall breaker uses this to tell a BUSY server (burning a core
+ * while it drains a burst) from a genuinely DEAD input path (flat CPU), and
+ * only tears the latter down. It reuses the same platform machinery as
+ * `startSpawnUsageSampler`: on Windows the direct child may be a `cmd`/`.cmd`
+ * shim that does no work itself, so the live descendant tree resolves once per
+ * read and CPU% is summed across it.
+ *
+ * Best-effort like every other export here: a failed query loses a data point,
+ * it never throws, and it never blocks for longer than the query timeouts plus
+ * `windowMs`. The target itself must resolve for `measured` to be true;
+ * missing descendants are partial but valid evidence. An unmeasurable target
+ * answers `{ busy: false, measured: false }` for the caller to classify.
+ */
+export async function sampleProcessTreeCpuPercent(
+	pid: number | undefined,
+	windowMs = 1200,
+	floorPercent = 10,
+): Promise<ProcessTreeCpuSample> {
+	if (!Number.isFinite(pid) || (pid as number) <= 0) {
+		return { busy: false, measured: false, cpuPercent: null };
+	}
+	const targetPid = pid as number;
+	const readOnce = async (): Promise<{
+		cpuPercent: number;
+		measured: boolean;
+	} | null> => {
+		try {
+			const descendants = runningOnWindows()
+				? await findDescendantPidsWindows(targetPid)
+				: [];
+			if (descendants === null) return null;
+			const pids = runningOnWindows()
+				? [targetPid, ...descendants]
+				: [targetPid];
+			const usageByPid = await sampleProcesses(pids);
+			if (usageByPid === null) return null;
+			const targetUsage = usageByPid.get(targetPid);
+			if (!targetUsage) return { cpuPercent: 0, measured: false };
+			let cpuPercent = 0;
+			for (const usage of usageByPid.values()) cpuPercent += usage.cpuPercent;
+			return { cpuPercent, measured: true };
+		} catch {
+			return null;
+		}
+	};
+	// The FIRST read populates the per-pid CPU history on Windows (a fresh pid
+	// reports 0%; the rate lands on the next read), so the second read is the
+	// one that carries the liveness verdict. Both reads must retain the target;
+	// disappearance or query failure is explicitly unmeasured, never flat.
+	const first = await readOnce();
+	const second = await new Promise<{
+		cpuPercent: number;
+		measured: boolean;
+	} | null>((resolve) => {
+		const timer = setTimeout(() => {
+			void readOnce().then(resolve);
+		}, windowMs);
+		timer.unref?.();
+	});
+	if (first === null && second === null) {
+		return { busy: false, measured: false, cpuPercent: null };
+	}
+	if (
+		first === null ||
+		second === null ||
+		!first.measured ||
+		!second.measured
+	) {
+		return { busy: false, measured: false, cpuPercent: null };
+	}
+	const observed = Math.max(first.cpuPercent, second.cpuPercent);
+	return {
+		busy: observed > floorPercent,
+		measured: true,
+		cpuPercent: observed,
+	};
+}
+
 export function startSpawnUsageSampler(
 	pid: number | undefined,
 	intervalMs = 750,

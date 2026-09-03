@@ -12,6 +12,7 @@
 import { promises as fs } from "node:fs";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
+import { BoundedLruCache } from "../clients/bounded-cache.js";
 import { Type } from "../clients/deps/typebox.js";
 import {
 	anchorsForDiagnostic,
@@ -22,6 +23,7 @@ import {
 	getDisposition,
 	type DispositionCandidate,
 } from "../clients/diagnostic-dispositions.js";
+import { DEPENDENCY_DRIFT_MAX_DELIVERIES } from "../clients/blocker-freshness.js";
 import { freshnessFromMtime } from "../clients/freshness.js";
 import { applyInlineSuppressions } from "../clients/dispatch/inline-suppressions.js";
 import { gateFindingsByPathFreshness } from "../clients/advisory-provenance.js";
@@ -79,6 +81,7 @@ import type {
 import type { ActionableWarningsReport } from "../clients/actionable-warnings.js";
 import type { CodeQualityWarningsReport } from "../clients/code-quality-warnings.js";
 import {
+	classifyDiagnosticTier,
 	getFileDiagnosticSummaries,
 	type FileDiagnosticSummary,
 	reconcileCorrelatedScanDiagnostics,
@@ -287,6 +290,7 @@ export function createLensDiagnosticsTool(
 			totalBlocking?: number;
 			totalErrors?: number;
 			totalWarnings?: number;
+			totalAdvisories?: number;
 			coldRunners?: string[];
 			failedAnalyzers?: { id: string; summary: string }[];
 		}>(({ details, args, isError, text }) => {
@@ -333,9 +337,16 @@ export function createLensDiagnosticsTool(
 			const b = details?.totalBlocking ?? 0;
 			const e = details?.totalErrors ?? 0;
 			const w = details?.totalWarnings ?? 0;
+			// #2414: hint/info tier never contributes to `b + e + w` — a session
+			// with only style opinions is genuinely "clean" of code defects, but
+			// the one-line summary still names the advisory count so it isn't
+			// indistinguishable from a session with zero findings at all.
+			const adv = details?.totalAdvisories ?? 0;
 			const files = details?.filesWithIssues ?? details?.filesChecked ?? 0;
 			if (b + e + w === 0) {
-				return `lens_diagnostics ${mode} — clean (${files} files)${coldSuffix}${failedSuffix}`;
+				const advisorySuffix =
+					adv > 0 ? `, ${adv} hint${adv === 1 ? "" : "s"}` : "";
+				return `lens_diagnostics ${mode} — clean${advisorySuffix} (${files} files)${coldSuffix}${failedSuffix}`;
 			}
 			const parts = [`${b} blocking`];
 			if (b === 0 && e > 0) parts.push(`${e} errors`);
@@ -611,11 +622,11 @@ function appendProjectDiagnosticsDeltaLines(
  * TTL. Insertion-ordered LRU cap bounds resident source bytes; repeated
  * queries and multi-file reports that cite the same file reuse one read.
  */
-const CACHED_CONTENT_MEMO_CAP = 64;
-const cachedContentMemo = new Map<
+export const CACHED_CONTENT_MEMO_CAP = 64;
+const cachedContentMemo = new BoundedLruCache<
 	string,
 	{ mtimeMs: number; size: number; content: string }
->();
+>(CACHED_CONTENT_MEMO_CAP);
 
 function readContentForAnchors(
 	filePath: string,
@@ -624,9 +635,6 @@ function readContentForAnchors(
 	const key = normalizeEphemeralMapKey(filePath);
 	const hit = cachedContentMemo.get(key);
 	if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) {
-		// Refresh LRU position.
-		cachedContentMemo.delete(key);
-		cachedContentMemo.set(key, hit);
 		return hit.content;
 	}
 	let content: string;
@@ -635,16 +643,21 @@ function readContentForAnchors(
 	} catch {
 		return undefined;
 	}
-	if (cachedContentMemo.size >= CACHED_CONTENT_MEMO_CAP) {
-		const oldest = cachedContentMemo.keys().next().value;
-		if (oldest !== undefined) cachedContentMemo.delete(oldest);
-	}
 	cachedContentMemo.set(key, {
 		mtimeMs: stat.mtimeMs,
 		size: stat.size,
 		content,
 	});
 	return content;
+}
+
+/** #2442 test-only: exercise the bounded content memo (LRU) directly,
+ *  without a full lens_diagnostics dispatch. */
+export function _readContentForAnchorsForTests(
+	filePath: string,
+	stat: { mtimeMs: number; size: number },
+): string | undefined {
+	return readContentForAnchors(filePath, stat as fsSync.Stats);
 }
 
 /**
@@ -765,11 +778,58 @@ function loadProjectRulePolicyMap(cwd: string) {
  * `clients/finding-delivery-gate.ts` surface `lens-diagnostics:mode-delta`.
  */
 function applyDeltaFreshnessGate<W extends DispositionCandidate>(
-	files: Array<{ filePath: string; warnings: W[] }>,
+	files: Array<{ filePath: string; warnings: W[]; generatedAt?: string }>,
 	cwd: string,
 	generatedAt: string | undefined,
 ): Array<{ filePath: string; warnings: Array<W & { stale?: boolean }> }> {
-	if (!generatedAt) return files;
+	// #2504 review round 4 (F1): an actionable-warnings report is no longer the
+	// product of exactly ONE pass. A deferred off-hook LSP pull upserts its
+	// per-file entries into whatever report is persisted when it lands, so one
+	// report can carry entries observed minutes apart. Judging the older half
+	// against the newer report-level stamp would pass an out-of-band edit made
+	// in between off as live -- exactly the leak this gate exists to stop. Each
+	// distinct stamp is gated on its own; the ordinary single-stamp report
+	// takes one pass, as before, and the original file order is preserved.
+	const stamps = new Set(
+		files.map((file) => file.generatedAt ?? generatedAt ?? ""),
+	);
+	if (stamps.size > 1) {
+		const gatedByPath = new Map<
+			string,
+			{ filePath: string; warnings: Array<W & { stale?: boolean }> }
+		>();
+		for (const stamp of stamps) {
+			const group = files.filter(
+				(file) => (file.generatedAt ?? generatedAt ?? "") === stamp,
+			);
+			for (const gated of applyDeltaFreshnessGate(
+				group.map((file) => ({
+					filePath: file.filePath,
+					warnings: file.warnings,
+				})),
+				cwd,
+				stamp === "" ? undefined : stamp,
+			)) {
+				gatedByPath.set(gated.filePath, gated);
+			}
+		}
+		return files
+			.map((file) => gatedByPath.get(file.filePath))
+			.filter(
+				(
+					entry,
+				): entry is {
+					filePath: string;
+					warnings: Array<W & { stale?: boolean }>;
+				} => entry !== undefined,
+			);
+	}
+	// Every entry shares one stamp here; prefer the per-entry one when it has
+	// it, so a merged report's single surviving half is still aged by its own.
+	const stampedAt = [...stamps][0];
+	const effectiveAt =
+		stampedAt !== undefined && stampedAt !== "" ? stampedAt : generatedAt;
+	if (!effectiveAt) return files;
 	const flat: Array<{ filePath: string; warning: W }> = [];
 	for (const file of files) {
 		for (const warning of file.warnings)
@@ -780,7 +840,7 @@ function applyDeltaFreshnessGate<W extends DispositionCandidate>(
 		store: "lens-diagnostics-delta",
 		findings: flat,
 		cwd,
-		scannedAt: generatedAt,
+		scannedAt: effectiveAt,
 		citedPath: (f) => f.filePath,
 		onMissing: "drop",
 	});
@@ -846,12 +906,17 @@ function formatDeltaMode(
 	const visibleWarningFiles = <
 		W extends DispositionCandidate & { observedAt?: number },
 	>(
-		files: Array<{ filePath: string; warnings?: W[] }> | undefined,
+		files:
+			| Array<{ filePath: string; warnings?: W[]; generatedAt?: string }>
+			| undefined,
 	) =>
 		(files ?? [])
 			.filter((file) => includeFile(file.filePath))
 			.map((file) => ({
 				filePath: file.filePath,
+				// #2504 r4 (F1): carried through, so a merged report's older
+				// entries keep their own age all the way to the freshness gate.
+				generatedAt: file.generatedAt,
 				warnings: applyRulePolicy(
 					applyCachedDispositions(file.warnings ?? [], cwd, file.filePath),
 					policyMap,
@@ -1231,30 +1296,31 @@ function summarizeDiagnostics(
 	let blocking = 0;
 	let errors = 0;
 	let warnings = 0;
+	let advisories = 0;
 	for (const diagnostic of diagnostics) {
 		// #1641: a demoted past-EOF entry keeps its severity for display but
 		// drops out of the tallies — same reasoning as widget-state's `isBlocking`.
 		if (diagnostic.stale) continue;
 		if (diagnostic.semantic === "blocking") blocking++;
-		if (diagnostic.severity === "error") errors++;
-		// #1777: `hint` and `info` tally alongside `warning`, matching
-		// `countDiagnostics` in `clients/widget-state.ts` — mode=all reads that
-		// tally and mode=full reads this one, so the two must agree. An exact
-		// `=== "warning"` test scored a hint-only file 0/0/0, the `withIssues`
-		// filter below then dropped it, and mode=full rendered "No issues" for a
-		// file whose own `details` still carried the diagnostic.
-		else if (
-			diagnostic.severity === "warning" ||
-			diagnostic.severity === "hint" ||
-			diagnostic.severity === "info"
-		)
-			warnings++;
+		// #2414: severity → tier classification is shared with
+		// `countDiagnostics`/`countAdvisories` in `clients/widget-state.ts` via
+		// `classifyDiagnosticTier` — mode=all reads that store's tally and
+		// mode=full reads this one, so the two must agree. `hint`/`info` no
+		// longer inflate `warnings` (they used to, matching a pre-#2414
+		// `countDiagnostics`, so a hint-only file scored 0/0/0 there too and the
+		// `withIssues` filter below dropped it — that gap is now closed via
+		// `advisories`, not by re-folding hints into `warnings`).
+		const tier = classifyDiagnosticTier(diagnostic);
+		if (tier === "error") errors++;
+		else if (tier === "warning") warnings++;
+		else if (tier === "advisory") advisories++;
 	}
 	return {
 		filePath,
 		blocking,
 		errors,
 		warnings,
+		advisories,
 		hasFinalSnapshot,
 		diagnostics,
 	};
@@ -2427,6 +2493,17 @@ function formatAllMode(
 	pathsScope?: PathsScope,
 	dependencyDemoted = 0,
 ): { content: [{ type: "text"; text: string }]; details: object } {
+	// #2275 review F2: the widget footer stops DRAWING a dependency-drift
+	// demotion once it hits `DEPENDENCY_DRIFT_MAX_DELIVERIES` unconfirmed
+	// deliveries, but the record stays here (dropping it would make an
+	// unconfirmed LSP error read as clean). Say so, through the same note
+	// channel as the demotion itself, so the agent knows why the footer went
+	// quiet and that a re-run can still confirm the finding.
+	const footerCapped = summaries.reduce(
+		(n, s) =>
+			n + (s.diagnostics ?? []).filter((d) => d.footerRetired === true).length,
+		0,
+	);
 	// Files changed/deleted since their diagnostics were recorded have already
 	// been dropped by reconcileStaleWidgetFiles; note them so the agent knows
 	// those aren't "clean", just un-rescanned (use mode=full to refresh).
@@ -2436,6 +2513,9 @@ function formatAllMode(
 			: "") +
 		(dependencyDemoted > 0
 			? ` (${dependencyDemoted} blocking finding${dependencyDemoted === 1 ? "" : "s"} demoted to [stale] — an imported file changed since; re-run to confirm)`
+			: "") +
+		(footerCapped > 0
+			? ` (${footerCapped} demoted finding${footerCapped === 1 ? "" : "s"} capped after ${DEPENDENCY_DRIFT_MAX_DELIVERIES} unconfirmed deliveries — no longer shown in the pi-lens footer, still listed here; re-run to confirm)`
 			: "");
 
 	// mode=full already actively scanned exactly the requested paths, so a zero
@@ -2494,11 +2574,18 @@ function formatAllMode(
 	// how those filters already treat any other non-matching severity.
 	const withIssues = visibleSummaries.filter((s) => {
 		if (severity === "error") return s.blocking > 0 || s.errors > 0;
+		// #2414: a "warning" filter must not admit hint/info — that is exactly
+		// the "present hints as warnings" defect this issue exists to close.
 		if (severity === "warning") return s.warnings > 0;
+		// severity: "all" — a hint/info-only file (`advisories > 0`,
+		// warnings === 0) must still surface here, or the #2414 fix that stops
+		// hints inflating `warnings` would silently drop that file from the
+		// detailed listing instead of just from the compact warning tally.
 		return (
 			s.blocking > 0 ||
 			s.errors > 0 ||
 			s.warnings > 0 ||
+			s.advisories > 0 ||
 			(s.diagnostics ?? []).some((d) => d.stale)
 		);
 	});
@@ -2532,6 +2619,7 @@ function formatAllMode(
 	let totalBlocking = 0;
 	let totalErrors = 0;
 	let totalWarnings = 0;
+	let totalAdvisories = 0;
 
 	for (const s of sorted) {
 		const rel = path.relative(cwd, s.filePath);
@@ -2539,6 +2627,11 @@ function formatAllMode(
 		if (s.blocking > 0) parts.push(`🔴 ${s.blocking} blocking`);
 		if (s.errors > 0 && s.blocking === 0) parts.push(`${s.errors}E`);
 		if (s.warnings > 0) parts.push(`${s.warnings}W`);
+		// #2414: hint/info never inflate `warnings`, but a hint-only row still
+		// needs a reason to be listed — otherwise it shows a bare filename with
+		// no count at all.
+		if (s.advisories > 0)
+			parts.push(`${s.advisories} hint${s.advisories === 1 ? "" : "s"}`);
 		if (!s.hasFinalSnapshot) parts.push(`(pending)`);
 		const staleCount = (s.diagnostics ?? []).filter((d) => d.stale).length;
 		if (staleCount > 0) {
@@ -2587,6 +2680,7 @@ function formatAllMode(
 		totalBlocking += s.blocking;
 		totalErrors += s.errors;
 		totalWarnings += s.warnings;
+		totalAdvisories += s.advisories;
 	}
 
 	// #1799: `totalBlocking` and `totalErrors` count the same findings UNLESS a
@@ -2608,6 +2702,11 @@ function formatAllMode(
 		totalWarnings > 0
 			? `  ${totalWarnings} warning${totalWarnings === 1 ? "" : "s"}`
 			: null,
+		// #2414: reported separately from `warnings` — hint/info are style
+		// opinions, not defects, and must not read as unresolved code issues.
+		totalAdvisories > 0
+			? `  ${totalAdvisories} hint/info (style — not counted as warnings)`
+			: null,
 	]
 		.filter(Boolean)
 		.join("\n");
@@ -2622,6 +2721,7 @@ function formatAllMode(
 			totalBlocking,
 			totalErrors,
 			totalWarnings,
+			totalAdvisories,
 			staleDropped,
 		},
 	};

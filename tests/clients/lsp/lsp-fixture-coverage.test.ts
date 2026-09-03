@@ -4,6 +4,10 @@ import { getServersForFileWithConfig } from "../../../clients/lsp/config.js";
 import { LSP_SERVERS } from "../../../clients/lsp/server.js";
 // Typed via scripts/smoke-tools.d.mts (the harness itself is plain ESM JS).
 import { LSP_FIXTURES } from "../../../scripts/smoke-tools.mjs";
+import {
+	catalogFixtureGaps,
+	staleExemptions,
+} from "../../support/public-surface-drift.js";
 import { assertNonEmptyScan } from "../../support/sweep-kit.js";
 
 /**
@@ -23,17 +27,17 @@ import { assertNonEmptyScan } from "../../support/sweep-kit.js";
  * server now forces a decision — add a fixture, or exempt it with a reason.
  */
 
-// Alternates that share an extension with a higher-priority default. The --lsp
-// layer exercises the default for that extension; the alternate is only reached
-// by availability fallthrough (default not installed) or an lsp.json override, so
-// it has no fixture of its own. Keep in lockstep with ALTERNATES in
-// lsp-primary-reachability.test.ts.
-const EXEMPT_PRIMARY = new Map<string, string>([
-	["deno", "alt of typescript; the .ts handshake covers the default"],
-	["python-jedi", "alt of python; the .py handshake covers the default"],
-	["omnisharp", "alt of csharp; the .cs handshake covers the default"],
-	["expert", "alt of ElixirLS; the .ex handshake covers the default"],
-]);
+// A fallback shares the preferred server's fixture because the --lsp layer
+// exercises the preferred handshake. The fallback is reached only by
+// availability fallthrough or an lsp.json override.
+const EXEMPT_PRIMARY = new Map(
+	LSP_SERVERS.filter(
+		(server) => server.role !== "auxiliary" && server.fallbackFor !== undefined,
+	).map((server) => [
+		server.id,
+		`fallback of ${server.fallbackFor}; the preferred handshake covers the default`,
+	]),
+);
 
 // Faithful to getClientForFile's candidate stage: resolve each fixture file to
 // its primary server (first non-auxiliary match in registry/config order). A
@@ -61,10 +65,17 @@ for (const fx of LSP_FIXTURES) {
 }
 
 describe("LSP handshake fixture coverage (nightly --lsp)", () => {
+	// The gap computation itself lives in `tests/support/public-surface-drift.ts`
+	// (#2427). This test was the PROVEN PATTERN the generalized harness was
+	// built from, so it consumes the harness rather than keeping the original
+	// alongside a copy — one implementation of "catalog entry with no fixture",
+	// which is the property #2416/#2383 will register their catalogs against.
 	it("every non-auxiliary server has an --lsp handshake fixture (or is an exempt alternate)", () => {
-		const uncovered = NON_AUX.filter(
-			(s) => !coveredPrimary.has(s.id) && !EXEMPT_PRIMARY.has(s.id),
-		).map((s) => s.id);
+		const uncovered = catalogFixtureGaps({
+			ids: NON_AUX.map((s) => s.id),
+			covered: coveredPrimary,
+			exempt: EXEMPT_PRIMARY,
+		});
 		expect(
 			uncovered,
 			`registered primary LSP server(s) with NO nightly handshake fixture — add an ` +
@@ -75,7 +86,10 @@ describe("LSP handshake fixture coverage (nightly --lsp)", () => {
 	});
 
 	it("every auxiliary server is exercised by a fixture's auxiliaryServerIds", () => {
-		const uncovered = AUX.filter((s) => !coveredAux.has(s.id)).map((s) => s.id);
+		const uncovered = catalogFixtureGaps({
+			ids: AUX.map((s) => s.id),
+			covered: coveredAux,
+		});
 		expect(
 			uncovered,
 			`auxiliary LSP server(s) not attached by any --lsp fixture — add an LSP_FIXTURES ` +
@@ -84,8 +98,10 @@ describe("LSP handshake fixture coverage (nightly --lsp)", () => {
 	});
 
 	it("no stale primary exemptions (every exempted id is still a registered server)", () => {
-		const ids = new Set(LSP_SERVERS.map((s) => s.id));
-		const stale = [...EXEMPT_PRIMARY.keys()].filter((id) => !ids.has(id));
+		const stale = staleExemptions(
+			LSP_SERVERS.map((s) => s.id),
+			EXEMPT_PRIMARY,
+		);
 		expect(
 			stale,
 			`exemption(s) for non-existent server(s): ${stale.join(", ")}`,

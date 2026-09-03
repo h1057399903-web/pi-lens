@@ -1,11 +1,11 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { normalizeLoggedPath } from "./path-utils.js";
 
-const LATENCY_LOG_DIR = getGlobalPiLensDir();
+const LATENCY_LOG_DIR = getGlobalPiLensLogDir();
 const LATENCY_LOG_FILE = path.join(LATENCY_LOG_DIR, "latency.log");
 
 const writer = createNdjsonLogger({
@@ -119,6 +119,11 @@ let recentPhases: Array<{ phase: string; ts: string }> = [];
  * usage records. It reports no new work and therefore cannot own last-phase
  * stall attribution.
  *
+ * #2249: `concurrent_session_bind_rollup` is the same shape as
+ * `session_end_bus_rollup`/`path_attribution_verified_rollup` above — a
+ * zero-duration session-end summary of records already logged individually,
+ * not new work of its own.
+ *
  * #2044: `test_runner_failed_target_state` is a zero-duration decision after a
  * bounded filesystem probe. The surrounding turn-end test-selection phase owns
  * any real work, so this row must not replace it in stall attribution.
@@ -141,8 +146,10 @@ const LAST_PHASE_EXCLUDED = new Set([
 	"lsp_scanner_coverage_gap",
 	"lsp_notify_resync_deferred",
 	"lsp_notify_write_late_landed",
+	"lsp_notify_stall_cpu_busy",
 	"degradation_ledger",
 	"path_attribution_verified_rollup",
+	"concurrent_session_bind_rollup",
 ]);
 
 /**

@@ -10,9 +10,9 @@
  * get the bounding right. This module is the intersection of those four, not
  * a speculative framework. Three of its four options come straight from those
  * sites. The fourth, `capPerTurn`, expresses #1733's per-turn bound
- * structurally but has no caller yet: that site's bound is its call cadence,
- * and pinning a cap there would red its own wiring tests. It ships tested and
- * mutation-proofed, awaiting its first site.
+ * structurally and now caps re-raised auxiliary coverage-gap detail rows
+ * (#2356), while the aggregate count and ledger retain bounded latest
+ * identities plus the dropped count.
  *
  * Three rules the helper makes structural instead of prose:
  *
@@ -38,7 +38,7 @@
  * stated reason for staying raw.
  *
  * Nothing here ever throws. Telemetry must not perturb the path it observes —
- * every one of the four migrated sites had already decided its outcome before
+ * each caller has already decided its outcome before
  * calling in.
  */
 
@@ -53,6 +53,13 @@ import { type LatencyEntry, logLatency } from "./latency-logger.js";
  * must not also be written by a raw `logLatency` call somewhere else.
  */
 export const BOUNDED_TELEMETRY_PHASES = [
+	/**
+	 * #2467: a demand for the analyzer bootstrap clients was not served and
+	 * the caller proceeded without them. Rising-edge per demand reason, with
+	 * the ledger holding the exact count — a wedged or missing analyzer graph
+	 * must not turn every tool call into a log line.
+	 */
+	"bootstrap_clients_unavailable",
 	/** #1705: a deferred-format record whose origin worktree never claimed it. */
 	"agent_end_deferred_format_orphan_origin_mismatch",
 	/** #1713: a `textDocument`/`workspace` diagnostic pull abandoned at budget. */
@@ -95,6 +102,8 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	 * the state cap. Selection checks and detailed rows are both capped per turn.
 	 */
 	"test_runner_failed_target_state",
+	/** #2366: bounded lifecycle records for automatic test-result delivery. */
+	"test_runner_delivery",
 	/**
 	 * #1723: an event-loop block at or above the floor. Not a degradation, so
 	 * no ledger kind; bounded by call cadence (one `turn_end` runs it once per
@@ -118,6 +127,52 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	 * command was declined on an UNKNOWN rather than assumed clean.
 	 */
 	"shared_checkout_probe_failed",
+	/** #2356: a notify-stall auxiliary remained uncovered after its bounded
+	 * replacement window. Detailed rows are capped per turn; the ledger and
+	 * aggregate turn-end row retain the complete count and identity. */
+	"lsp_scanner_coverage_gap",
+	/** #2358: a busy CPU discriminator deferred notify-stall teardown. */
+	"lsp_notify_stall_cpu_busy",
+	/**
+	 * #2430: an observational pre/post snapshot was declined or cut short — the
+	 * per-turn budget was already spent, the capture timed out, or the turn was
+	 * aborted. Every unclassified tool call in a busy turn can reach this, so
+	 * it is capped per turn with the ledger holding the exact count.
+	 */
+	"observed_mutation_budget_exhausted",
+	/**
+	 * #2430: the `agent_settled` tracked-file sweep could not complete within
+	 * its bound. Once per settle at most, capped for the same reason.
+	 */
+	"observed_sweep_skipped_budget",
+	/**
+	 * #2430: a tracked file's size/mtime moved but no hashed baseline could
+	 * confirm the bytes actually changed — too large for the sweep's read
+	 * budget, or never hashed. Named rather than replayed, because a `touch`
+	 * moves mtime without moving a byte (#2449 review round 2, F7). Bounded
+	 * per turn: one settle can find many such files at once.
+	 */
+	"observed_sweep_unverifiable",
+	/**
+	 * #2430: an armed observation's universe was TRUNCATED because the tool
+	 * named a directory with more entries than the net may watch. Bounded per
+	 * turn with the ledger holding the exact count, and the identity is the
+	 * tool name so the record answers WHICH tool is being watched partially
+	 * (#2449 review round 3).
+	 */
+	"observed_target_dir_capped",
+	/**
+	 * #2430: the "pi-lens wrote these bytes itself" set hit
+	 * `OBSERVED_HANDLED_MAX` and dropped its oldest entry. The dropped file is
+	 * NAMED, because the eviction silently reintroduces the exact defect
+	 * #2449 round 3 (S5) fixed: the ledger still holds the pre-drain bytes
+	 * while the only record that those bytes were ours is gone, so the next
+	 * settled sweep replays pi-lens's own formatter output as third-party
+	 * drift. A cap that drops a mark has to say which one (catalog shape 10);
+	 * capped per turn because a turn that overflows the set overflows it many
+	 * times (#2449 review round 4, S2).
+	 */
+	"observed_handled_evicted",
 ] as const;
 
 export type BoundedPhase = (typeof BOUNDED_TELEMETRY_PHASES)[number];

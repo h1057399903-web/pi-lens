@@ -1102,7 +1102,7 @@ describe("lsp server policy", () => {
 		expect(spawned).toBeDefined();
 		expect(spawned?.source).toBe("direct");
 		expect(spawned?.initialization).toBeUndefined();
-		// ty is PATH-only — never gated behind ensureTool/managed install.
+		// ty remains opt-in and never enters the managed installer tier.
 		expect(ensureTool).not.toHaveBeenCalled();
 		expect(
 			launchLSP.mock.calls.some(
@@ -1110,6 +1110,149 @@ describe("lsp server policy", () => {
 					command === "ty" && Array.isArray(args) && args[0] === "server",
 			),
 		).toBe(true);
+	});
+
+	it("prefers project-local ty over PATH pyright from an unactivated .venv", async () => {
+		const { PythonServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ty-venv-"));
+		dirs.push(tmp);
+
+		const environmentRoot = path.join(tmp, ".venv");
+		const binDir = path.join(
+			environmentRoot,
+			process.platform === "win32" ? "Scripts" : "bin",
+		);
+		const pythonPath = path.join(
+			binDir,
+			process.platform === "win32" ? "python.exe" : "python",
+		);
+		const tyPath = path.join(
+			binDir,
+			process.platform === "win32" ? "ty.exe" : "ty",
+		);
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.writeFileSync(pythonPath, "#!/usr/bin/env python\n");
+		fs.writeFileSync(tyPath, "#!/usr/bin/env python\n");
+
+		const originalVenv = process.env.VIRTUAL_ENV;
+		const originalConda = process.env.CONDA_PREFIX;
+		delete process.env.VIRTUAL_ENV;
+		delete process.env.CONDA_PREFIX;
+
+		let tyLaunchOptions: { env?: NodeJS.ProcessEnv; cwd?: string } | undefined;
+		launchLSP.mockImplementation(
+			async (
+				command: string,
+				args: string[],
+				options?: { env?: NodeJS.ProcessEnv; cwd?: string },
+			) => {
+				if (command === tyPath && args?.[0] === "server") {
+					tyLaunchOptions = options;
+					return {
+						process: { killed: false } as never,
+						stdin: {} as never,
+						stdout: {} as never,
+						stderr: {} as never,
+						pid: 5679,
+					};
+				}
+				// Simulate pi-lens's managed Pyright being visible to a bare PATH lookup.
+				if (command === "pyright-langserver") {
+					return {
+						process: { killed: false } as never,
+						stdin: {} as never,
+						stdout: {} as never,
+						stderr: {} as never,
+						pid: 5680,
+					};
+				}
+				throw toolNotFound(`unexpected command: ${command}`);
+			},
+		);
+
+		try {
+			const spawned = await PythonServer.spawn(tmp, { allowInstall: true });
+			expect(spawned).toBeDefined();
+			expect(tyLaunchOptions?.cwd).toBe(tmp);
+			expect(tyLaunchOptions?.env?.VIRTUAL_ENV).toBe(environmentRoot);
+			expect(tyLaunchOptions?.env?.PATH?.split(path.delimiter)[0]).toBe(binDir);
+			expect(process.env.VIRTUAL_ENV).toBeUndefined();
+			expect(ensureTool).not.toHaveBeenCalled();
+			expect(
+				launchLSP.mock.calls.some(
+					([command]) => command === "pyright-langserver",
+				),
+			).toBe(false);
+		} finally {
+			if (originalVenv === undefined) delete process.env.VIRTUAL_ENV;
+			else process.env.VIRTUAL_ENV = originalVenv;
+			if (originalConda === undefined) delete process.env.CONDA_PREFIX;
+			else process.env.CONDA_PREFIX = originalConda;
+		}
+	});
+
+	it("prefers project-local basedpyright over PATH pyright", async () => {
+		const { PythonServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-basedpyright-venv-"),
+		);
+		dirs.push(tmp);
+
+		const environmentRoot = path.join(tmp, ".venv");
+		const binDir = path.join(
+			environmentRoot,
+			process.platform === "win32" ? "Scripts" : "bin",
+		);
+		const pythonPath = path.join(
+			binDir,
+			process.platform === "win32" ? "python.exe" : "python",
+		);
+		const basedpyrightPath = path.join(
+			binDir,
+			process.platform === "win32"
+				? "basedpyright-langserver.exe"
+				: "basedpyright-langserver",
+		);
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.writeFileSync(pythonPath, "#!/usr/bin/env python\n");
+		fs.writeFileSync(basedpyrightPath, "#!/usr/bin/env python\n");
+
+		const originalVenv = process.env.VIRTUAL_ENV;
+		const originalConda = process.env.CONDA_PREFIX;
+		delete process.env.VIRTUAL_ENV;
+		delete process.env.CONDA_PREFIX;
+
+		launchLSP.mockImplementation(async (command: string) => {
+			if (command === basedpyrightPath || command === "pyright-langserver") {
+				return {
+					process: { killed: false } as never,
+					stdin: {} as never,
+					stdout: {} as never,
+					stderr: {} as never,
+					pid: 5681,
+				};
+			}
+			throw toolNotFound(`unexpected command: ${command}`);
+		});
+
+		try {
+			const spawned = await PythonServer.spawn(tmp, { allowInstall: true });
+			expect(spawned).toBeDefined();
+			expect(
+				launchLSP.mock.calls.some(([command]) => command === basedpyrightPath),
+			).toBe(true);
+			expect(
+				launchLSP.mock.calls.some(
+					([command]) => command === "pyright-langserver",
+				),
+			).toBe(false);
+			expect(ensureTool).not.toHaveBeenCalled();
+		} finally {
+			if (originalVenv === undefined) delete process.env.VIRTUAL_ENV;
+			else process.env.VIRTUAL_ENV = originalVenv;
+			if (originalConda === undefined) delete process.env.CONDA_PREFIX;
+			else process.env.CONDA_PREFIX = originalConda;
+		}
 	});
 
 	it("prefers a locally-found pyright over ty (opt-in fallback never wins when pyright is available)", async () => {
@@ -1676,6 +1819,71 @@ describe("monorepo root hoisting (#1671)", () => {
 		process.chdir(crateDir);
 
 		await expect(RustServer.root(file)).resolves.toBe(crateDir);
+	});
+
+	it("RustServer.root ignores a commented-out members entry even though the crate still exists on disk (#2473 review round 2, F1)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cargo-commented-member-"),
+		);
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			[
+				"[workspace]",
+				"members = [",
+				'    "crate-a",',
+				'    # "crate-b",',
+				"]",
+			].join("\n"),
+		);
+		const crateAFile = path.join(tmp, "crate-a", "src", "lib.rs");
+		fs.mkdirSync(path.dirname(crateAFile), { recursive: true });
+		fs.writeFileSync(
+			path.join(tmp, "crate-a", "Cargo.toml"),
+			'[package]\nname = "crate-a"\n',
+		);
+		fs.writeFileSync(crateAFile, "pub fn x() {}\n");
+
+		// crate-b physically exists on disk but its `members` entry is
+		// commented out — it must stay independently rooted, not get swept
+		// into the workspace's shared rust-analyzer root.
+		const crateBFile = path.join(tmp, "crate-b", "src", "lib.rs");
+		fs.mkdirSync(path.dirname(crateBFile), { recursive: true });
+		fs.writeFileSync(
+			path.join(tmp, "crate-b", "Cargo.toml"),
+			'[package]\nname = "crate-b"\n',
+		);
+		fs.writeFileSync(crateBFile, "pub fn y() {}\n");
+
+		await expect(RustServer.root(crateAFile)).resolves.toBe(tmp);
+		await expect(RustServer.root(crateBFile)).resolves.toBe(
+			path.join(tmp, "crate-b"),
+		);
+	});
+
+	it("RustServer.root hoists a member declared under an INDENTED [workspace] heading (#2473 review round 2, F2)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cargo-indented-heading-"),
+		);
+		dirs.push(tmp);
+
+		// Valid TOML: a table heading need not start in column 0.
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'  [workspace]\n  members = ["crate-a"]\n',
+		);
+		const crateFile = path.join(tmp, "crate-a", "src", "lib.rs");
+		fs.mkdirSync(path.dirname(crateFile), { recursive: true });
+		fs.writeFileSync(
+			path.join(tmp, "crate-a", "Cargo.toml"),
+			'[package]\nname = "crate-a"\n',
+		);
+		fs.writeFileSync(crateFile, "pub fn x() {}\n");
+
+		await expect(RustServer.root(crateFile)).resolves.toBe(tmp);
 	});
 
 	it("JavaServer.root hoists declared Maven modules to the parent pom, but leaves an undeclared sibling crate-rooted", async () => {

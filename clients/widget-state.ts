@@ -1,6 +1,7 @@
 import { stat } from "node:fs/promises";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import {
 	demotePastEofDiagnostics,
 	type LineCountCache,
@@ -13,6 +14,7 @@ import { collectForwardImportMtimes } from "./blocker-freshness.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { PAST_EOF_STALE_MARKER } from "./diagnostic-line-freshness.js";
 import { STALE_LINE_MARKER } from "./stale-marker.js";
+import type { FormatterOutcomeKind } from "./formatters.js";
 
 /**
  * Canonical key for the `files` map (and `diagnosticsWriteGuard`) — #1020.
@@ -96,6 +98,45 @@ export interface WidgetDiagnostic {
 	/** Which freshness gate demoted this entry: "past-eof" (#1641) or
 	 * "dependency-drift" (#1631). Each gate heals only its own demotions. */
 	staleReason?: string;
+	/**
+	 * #2275: how many turn ends have re-served this diagnostic while
+	 * `stale && staleReason === "dependency-drift"`. Sibling of
+	 * `InlineBlockerRecord.staleDeliveryCount` (#1950) — same cap
+	 * (`DEPENDENCY_DRIFT_MAX_DELIVERIES`, `clients/blocker-freshness.ts`),
+	 * same "capped, re-run can still confirm" semantics, but tracked in THIS
+	 * completely separate store (the widget footer's own `files` map, not
+	 * `RuntimeCoordinator`'s inline-blocker map) because the two surfaces
+	 * demote independently — see `markWidgetFileBlockersStale`'s doc. Only
+	 * ever set for the `"dependency-drift"` reason; the widget's past-EOF
+	 * demotion re-derives per render (`applyPastEofGate`) rather than
+	 * latching, so it has no equivalent delivery count to cap.
+	 *
+	 * Counts RENDERS, not turn ends (#2275 review F1): the footer draws one
+	 * record per pass (`renderWidget`'s `withBlocking[0]`, its first five
+	 * qualifying entries), so a turn that ended without this row on screen
+	 * delivered nothing. `renderWidget` marks what it drew;
+	 * `runtime-turn.ts`'s turn-end step commits those marks through
+	 * `drainRenderedDependencyDriftFilePaths` — the widget-surface analogue
+	 * of #1950's own deferred-until-delivered commit.
+	 */
+	staleDeliveryCount?: number;
+	/**
+	 * #2275 review F2: this dependency-drift demotion reached its delivery
+	 * cap, so the FOOTER stops showing it — the entry itself stays in
+	 * `allDiagnostics`.
+	 *
+	 * Retirement here is hide-from-footer, never drop. `allDiagnostics` is
+	 * also what `getFileDiagnosticSummaries` (`lens_diagnostics mode=all`)
+	 * and `lens_diagnostic_mark`'s cross-check read; splicing the entry out
+	 * would make an unconfirmed LSP error read as CLEAN on those surfaces
+	 * and take it out of the error tally #1631 requires it to stay in. The
+	 * capped row therefore keeps its `stale`/`staleReason` demotion
+	 * everywhere else, and mode=all says in words that the footer stopped
+	 * showing it and a re-run can still confirm it. Cleared implicitly by
+	 * any later `recordDiagnostics` (which replaces `allDiagnostics`
+	 * wholesale), and stripped on session restore alongside `stale`.
+	 */
+	footerRetired?: boolean;
 }
 
 /**
@@ -121,7 +162,10 @@ export function isBlocking(d: WidgetDiagnostic): boolean {
 interface FileRecord {
 	filePath: string;
 	runners: Map<string, { status: string; count: number; durationMs?: number }>;
-	formatters: Map<string, { changed: boolean; success: boolean }>;
+	formatters: Map<
+		string,
+		{ changed: boolean; success: boolean; outcome?: FormatterOutcomeKind }
+	>;
 	/** Capped to MAX_STORED_DIAGNOSTICS_PER_FILE — drives the TUI widget. */
 	diagnostics: WidgetDiagnostic[];
 	/**
@@ -150,7 +194,6 @@ interface LspRecord {
 // ── Module state ─────────────────────────────────────────────────────────────
 
 const files = new Map<string, FileRecord>();
-const lspServers = new Map<string, LspRecord>();
 let sessionLanguages: string[] = [];
 let requestRenderFn: (() => void) | null = null;
 
@@ -175,7 +218,10 @@ const runnerWriteGuard = new WriteOrderingGuard<string, number>();
 const MAX_STORED_DIAGNOSTICS_PER_FILE = 12;
 const MAX_INACTIVE_FILE_RECORDS = 1024;
 const ACTIVE_FILE_IDLE_MS = 30 * 60_000;
-const MAX_LSP_SERVER_RECORDS = 128;
+export const MAX_LSP_SERVER_RECORDS = 128;
+const lspServers = new BoundedFifoMap<string, LspRecord>(
+	MAX_LSP_SERVER_RECORDS,
+);
 // Pruning is a cold-size-boundary operation. Do not walk the whole file map
 // for every record in a large diagnostics reconciliation; the full-scan path
 // can legitimately create thousands of records in one synchronous batch.
@@ -209,8 +255,24 @@ export function setRenderCallback(fn: () => void): void {
 	requestRenderFn = fn;
 }
 
+/**
+ * #2275 review F1: files whose dependency-drift-demoted rows the footer has
+ * ACTUALLY DRAWN since the last turn end — the delivery population
+ * `runtime-turn.ts`'s cap step drains.
+ *
+ * The footer is not a broadcast of the whole store: `renderWidget` picks ONE
+ * record (`withBlocking[0]`) and its first five qualifying entries, and it
+ * may not be drawn at all (headless, or a turn with no repaint). Counting a
+ * delivery per turn end therefore charged the cap for rows the agent never
+ * saw, and retired them a delivery early. A Set (not a counter) is the right
+ * shape: the widget repaints many times per turn, and all of those repaints
+ * are the SAME one delivery.
+ */
+const renderedDependencyDriftFiles = new Set<string>();
+
 export function clearWidgetState(): void {
 	files.clear();
+	renderedDependencyDriftFiles.clear();
 	lspServers.clear();
 	sessionLanguages = [];
 	requestRenderFn = null;
@@ -245,7 +307,12 @@ export interface PersistedWidgetState {
 		runners: Array<
 			[string, { status: string; count: number; durationMs?: number }]
 		>;
-		formatters: Array<[string, { changed: boolean; success: boolean }]>;
+		formatters: Array<
+			[
+				string,
+				{ changed: boolean; success: boolean; outcome?: FormatterOutcomeKind },
+			]
+		>;
 		diagnostics: WidgetDiagnostic[];
 		allDiagnostics: WidgetDiagnostic[];
 		diagnosticCounts: { blocking: number; errors: number; warnings: number };
@@ -297,7 +364,25 @@ function migrateEntryStamps(
 	recordTouchedAt: number,
 ): WidgetDiagnostic[] {
 	return (entries ?? []).map((d) => {
-		const { stale: _stale, ...rest } = d;
+		// #2275: strip staleDeliveryCount and footerRetired alongside stale — a
+		// delivery count (and the footer-hide it earned) without the demotion
+		// it counts is meaningless, and a resumed session re-evaluates
+		// dependency-drift from scratch (#1631 review F3) same as the `stale`
+		// bit itself. A restored footer has shown the row zero times.
+		// Fix-round 3 (#2275 review F2): `staleReason` left the round trip
+		// unstripped, so a resumed row could carry `staleReason:
+		// "dependency-drift"` with `stale` gone — `isDependencyDriftDemoted`
+		// reads `stale === true`, so that combination reads as clean today, but
+		// the stray reason is still a demotion label with no demotion behind
+		// it, the same "meaningless without the bit it counts" shape as the
+		// other three fields. Strip it alongside them.
+		const {
+			stale: _stale,
+			staleDeliveryCount: _staleDeliveryCount,
+			footerRetired: _footerRetired,
+			staleReason: _staleReason,
+			...rest
+		} = d;
 		return rest.observedAt == null
 			? { ...rest, observedAt: recordTouchedAt }
 			: rest;
@@ -414,9 +499,10 @@ export function recordFormatter(
 	formatter: string,
 	changed: boolean,
 	success: boolean,
+	outcome?: FormatterOutcomeKind,
 ): void {
 	const rec = getOrCreate(filePath);
-	rec.formatters.set(formatter, { changed, success });
+	rec.formatters.set(formatter, { changed, success, outcome });
 	rec.touchedAt = Date.now();
 	files.set(fileMapKey(filePath), rec);
 	requestRender();
@@ -579,7 +665,42 @@ function commitDiagnostics(
 	requestRender();
 }
 
-/** Recompute the {blocking, errors, warnings} tally for a diagnostic set. */
+/**
+ * A diagnostic's compact-count tier (#2414). THE one place every compact
+ * finding-count surface classifies severity into a tally bucket — do not
+ * re-fold tiers per renderer (widget footer, `lens_diagnostics`' `withIssues`
+ * listing/summary, and any future compact surface all import this instead of
+ * hand-rolling the same branch).
+ *
+ * `error`/`warning` are real code defects with a known, bounded
+ * false-positive rate (see "Severity policy" in AGENTS.md, #1777) — they
+ * drive the footer's ●/! chips and block-worthy counts. `advisory` (`hint` +
+ * `info`) is a style opinion: an unaudited authorship rule (complexity,
+ * `no-runtime-typeof`, ...) must never present with the same weight as a
+ * warning. Before #1777 the dispatch path collapsed all three into
+ * `"warning"` at the runner; after #1777 preserved the four LSP/ast-grep
+ * tiers end to end, but this classifier still folded `hint`/`info` into the
+ * `warnings` tally so a file with only style opinions didn't silently vanish
+ * from the footer. #2414 corrects that: advisories no longer inflate
+ * `warnings`, but every consumer must still ask "does this file have ANY
+ * live finding" via `advisories`, not just `warnings`, so a hint-only file
+ * still surfaces in a detailed listing (mode=all's `withIssues`).
+ */
+export type DiagnosticTier = "error" | "warning" | "advisory";
+
+export function classifyDiagnosticTier(
+	d: WidgetDiagnostic,
+): DiagnosticTier | undefined {
+	if (d.severity === "error") return "error";
+	if (d.severity === "warning") return "warning";
+	if (d.severity === "hint" || d.severity === "info") return "advisory";
+	return undefined;
+}
+
+/** Recompute the {blocking, errors, warnings} tally for a diagnostic set.
+ * `hint`/`info` tier findings are tallied separately — see
+ * {@link classifyDiagnosticTier} and {@link countAdvisories} — and never
+ * inflate `warnings` (#2414). */
 function countDiagnostics(diags: WidgetDiagnostic[]): {
 	blocking: number;
 	errors: number;
@@ -601,22 +722,33 @@ function countDiagnostics(diags: WidgetDiagnostic[]): {
 			(diagnostic.staleReason ?? "past-eof") === "past-eof"
 		)
 			continue;
-		if (diagnostic.severity === "error") errors++;
-		// #1777: `hint` and `info` tally alongside `warning`. The dispatch path
-		// now preserves all four ast-grep tiers; before, the runner collapsed
-		// them to "warning" here. An exact `=== "warning"` test would drop those
-		// findings out of the footer entirely, so a file with real findings would
-		// render clean. The footer stays a blocking/error/warning summary on
-		// purpose — the tier distinction is rendered by the code-quality-warnings
-		// advisory, not by these counters.
-		else if (
-			diagnostic.severity === "warning" ||
-			diagnostic.severity === "hint" ||
-			diagnostic.severity === "info"
-		)
-			warnings++;
+		const tier = classifyDiagnosticTier(diagnostic);
+		if (tier === "error") errors++;
+		else if (tier === "warning") warnings++;
+		// tier === "advisory" (hint/info): intentionally excluded from the
+		// footer's warning tally (#2414) — see `countAdvisories` for the
+		// parallel count `getFileDiagnosticSummaries` exposes to
+		// `lens_diagnostics` so a hint-only file still shows up as "has issues".
 	}
 	return { blocking, errors, warnings };
+}
+
+/** Count `hint`/`info` tier findings using the same past-EOF exclusion as
+ * {@link countDiagnostics} (#2414). Kept as a standalone accessor rather than
+ * a new `FileRecord.diagnosticCounts` field — the footer never renders this
+ * number, only `getFileDiagnosticSummaries` (mode=all) needs it, to keep a
+ * hint-only file from being silently dropped from a detailed listing. */
+function countAdvisories(diags: WidgetDiagnostic[]): number {
+	let advisories = 0;
+	for (const diagnostic of diags) {
+		if (
+			diagnostic.stale &&
+			(diagnostic.staleReason ?? "past-eof") === "past-eof"
+		)
+			continue;
+		if (classifyDiagnosticTier(diagnostic) === "advisory") advisories++;
+	}
+	return advisories;
 }
 
 /**
@@ -1113,6 +1245,107 @@ export function markWidgetFileBlockersStale(
 }
 
 /**
+ * #2275: a dependency-drift demotion the footer is still allowed to draw —
+ * the one predicate the render marker, the delivery counter and the
+ * footer-hide all ask, so "which rows does this cap govern" cannot drift
+ * apart between them.
+ */
+function isDependencyDriftDemoted(d: WidgetDiagnostic): boolean {
+	return (
+		d.stale === true &&
+		d.staleReason === "dependency-drift" &&
+		d.footerRetired !== true
+	);
+}
+
+/**
+ * #2275 review F1: take (and clear) the files whose dependency-drift
+ * demotions the footer actually RENDERED since the last call — the delivery
+ * population `runtime-turn.ts`'s per-turn cap step walks at turn end.
+ *
+ * Deliberately NOT a store-wide query over everything currently demoted.
+ * `renderWidget` serves one record per pass, so a store-wide walk charged a
+ * delivery to every demoted file every turn — including files the footer had
+ * never shown and one demoted moments earlier by the same turn end, which
+ * also made the ledger's "capped after N deliveries" overstate N by one.
+ * Draining here is what makes many repaints within one turn count as the one
+ * delivery they are, and a turn with no repaint count as none.
+ */
+export function drainRenderedDependencyDriftFilePaths(): string[] {
+	const out = [...renderedDependencyDriftFiles];
+	renderedDependencyDriftFiles.clear();
+	return out;
+}
+
+/**
+ * #2275: commit one more RENDERED delivery of `filePath`'s
+ * dependency-drift-demoted diagnostics. Every qualifying entry on the record
+ * advances together — `markWidgetFileBlockersStale` demotes them as one
+ * batch per file, so they share one delivery history, mirroring that
+ * write's own file-level scope. Returns the new count, or 0 when the file
+ * has nothing this cap governs (never demoted, or already footer-retired —
+ * a hidden row is delivered no more, so it must stop advancing).
+ */
+export function incrementWidgetDependencyDriftDelivery(
+	filePath: string,
+): number {
+	const rec = files.get(fileMapKey(filePath));
+	if (!rec) return 0;
+	let next = 0;
+	for (const d of rec.allDiagnostics) {
+		if (isDependencyDriftDemoted(d)) {
+			next = (d.staleDeliveryCount ?? 0) + 1;
+			d.staleDeliveryCount = next;
+		}
+	}
+	return next;
+}
+
+/**
+ * #2275 review F2: retire every dependency-drift-demoted diagnostic on
+ * `filePath` once its delivery cap is reached — by HIDING it from the
+ * footer, not by dropping it.
+ *
+ * `RuntimeCoordinator.retireDemotedDependencyDriftBlocker` can delete its
+ * whole `_pendingInlineBlockers` record because that store backs exactly one
+ * surface (the turn-end advisory text). This store does not: `allDiagnostics`
+ * is also what `getFileDiagnosticSummaries` serves to `lens_diagnostics
+ * mode=all` and what `lens_diagnostic_mark` cross-checks to reanchor. Removing
+ * the entry there turned an unconfirmed LSP error into a CLEAN read and took
+ * it out of the error tally #1631 requires it to stay in. So the cap marks
+ * `footerRetired` and leaves everything else — severity, counts, the
+ * `stale`/`dependency-drift` demotion — exactly as it was; mode=all carries
+ * the "capped, still confirmable" wording in its own note. Returns true iff
+ * something changed (idempotent on a second call).
+ */
+export function retireWidgetDependencyDriftBlockers(filePath: string): boolean {
+	const rec = files.get(fileMapKey(filePath));
+	if (!rec) return false;
+	let changed = false;
+	for (const d of rec.allDiagnostics) {
+		if (isDependencyDriftDemoted(d)) {
+			d.footerRetired = true;
+			changed = true;
+		}
+	}
+	if (!changed) return false;
+	// The record's severity tallies are unchanged by design (the finding is
+	// still an error, still non-blocking) — only what the footer draws moves.
+	// Fix-round 3 (#2275 review F1): this delete is live only for the
+	// multi-file drain re-render case — `drainRenderedDependencyDriftFilePaths`
+	// already clears the whole Set before this loop starts, so by the time a
+	// given `wPath` reaches this call its own entry is normally long gone. It
+	// only does something when a render for a DIFFERENT file interleaves
+	// between the drain and this retire (adding `rec.filePath` back to the
+	// Set mid-loop) or a render fires between retirement and the caller's next
+	// drain — either way, defensive: it keeps a just-retired file from being
+	// double-drained (and double-charged) on the next pass.
+	renderedDependencyDriftFiles.delete(rec.filePath);
+	requestRenderFn?.();
+	return true;
+}
+
+/**
  * Keep the TUI honest (#298 follow-up). `reconcileStaleWidgetFiles` drops
  * widget entries whose file changed on disk after they were last recorded
  * (i.e. diagnostics the agent already fixed) — but it was only ever wired
@@ -1140,6 +1373,10 @@ export interface FileDiagnosticSummary {
 	blocking: number;
 	errors: number;
 	warnings: number;
+	/** `hint`/`info` tier findings — style opinions, never folded into
+	 * `warnings` (#2414). A file whose only findings are advisories still has
+	 * `advisories > 0` so it is not silently dropped from a detailed listing. */
+	advisories: number;
 	hasFinalSnapshot: boolean;
 	/**
 	 * The full, uncapped diagnostics for this file (not limited by the TUI's
@@ -1164,6 +1401,7 @@ export function getFileDiagnosticSummaries(): FileDiagnosticSummary[] {
 			blocking: rec.diagnosticCounts.blocking,
 			errors: rec.diagnosticCounts.errors,
 			warnings: rec.diagnosticCounts.warnings,
+			advisories: countAdvisories(rec.allDiagnostics),
 			hasFinalSnapshot: rec.hasFinalDiagnosticsSnapshot,
 			diagnostics: rec.allDiagnostics.map((d) => ({ ...d })),
 		};
@@ -1235,11 +1473,6 @@ export function recordLsp(
 				? "ready"
 				: "failed";
 	lspServers.set(key, { serverId, root, status: mapped, durationMs });
-	while (lspServers.size > MAX_LSP_SERVER_RECORDS) {
-		const oldest = lspServers.keys().next().value;
-		if (oldest === undefined) break;
-		lspServers.delete(oldest);
-	}
 	requestRender();
 }
 
@@ -1318,8 +1551,13 @@ export function renderWidget(
 	// the footer entirely instead of demoting visibly. `isBlockingOrDemoted` keeps
 	// it in the list; the per-entry render below distinguishes the two with a
 	// dimmed marker instead of the red dot.
+	//
+	// #2275: a demotion that reached its delivery cap is hidden from THIS
+	// surface only (`footerRetired`) — it stays in `allDiagnostics` for
+	// mode=all and lens_diagnostic_mark, which is where the agent is told it
+	// was capped and can still be confirmed by a re-run.
 	const isBlockingOrDemoted = (d: WidgetDiagnostic) =>
-		isBlocking(d) || d.stale === true;
+		(isBlocking(d) || d.stale === true) && d.footerRetired !== true;
 	const withBlocking = recencySorted.filter((r) =>
 		r.diagnostics.some(isBlockingOrDemoted),
 	);
@@ -1339,6 +1577,18 @@ export function renderWidget(
 			lines.push(fitLine(` ${dim(path.basename(rec.filePath))}`, w));
 		}
 		const blockers = rec.diagnostics.filter(isBlockingOrDemoted).slice(0, 5);
+		// #2275 review F1: THIS is the point where a demoted row is delivered to
+		// a human — after the `withBlocking[0]` pick and the top-five slice, not
+		// before them. Mark the file so the next turn end can charge exactly one
+		// delivery against its cap. File-level, matching
+		// `markWidgetFileBlockersStale`'s own file-level demotion batch (all of a
+		// file's drift demotions share one delivery history); a file holding more
+		// than five demoted rows delivers the visible ones and counts the batch,
+		// which is the conservative direction — it retires no LATER than the rows
+		// the agent actually read.
+		if (blockers.some(isDependencyDriftDemoted)) {
+			renderedDependencyDriftFiles.add(rec.filePath);
+		}
 		for (const d of blockers) {
 			// A past-EOF demotion's coordinate is untrustworthy — render the
 			// marker instead of the line (#1641); drift demotions keep theirs.
@@ -1438,7 +1688,10 @@ function formatFileRowVertical(
 		.filter(([, f]) => f.changed && f.success)
 		.map(([name]) => name);
 	const failedFormatters = [...rec.formatters.entries()]
-		.filter(([, f]) => !f.success)
+		// An `unavailable` tool is not a code failure (#2413): it never earns a red
+		// `fmt-failed` marker. Its result already carries success:true, so this
+		// guard is a belt that keeps the intent explicit at the render seam.
+		.filter(([, f]) => !f.success && f.outcome !== "unavailable")
 		.map(([name]) => name);
 	const formatMark =
 		(failedFormatters.length > 0
@@ -1595,7 +1848,11 @@ function hasChangedFormatter(rec: FileRecord): boolean {
 }
 
 function hasFailedFormatter(rec: FileRecord): boolean {
-	return [...rec.formatters.values()].some((f) => !f.success);
+	// `unavailable` (#2413) is success:true and must never count as a failure —
+	// the explicit guard keeps that true even if a future path mislabels it.
+	return [...rec.formatters.values()].some(
+		(f) => !f.success && f.outcome !== "unavailable",
+	);
 }
 
 function shouldRenderFile(rec: FileRecord): boolean {

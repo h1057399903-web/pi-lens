@@ -13,6 +13,7 @@
 
 import type { FileKind } from "../file-kinds.js";
 import type { FileRole } from "../file-role.js";
+import type { GeneratedArtifactEvidence } from "../generated-artifacts.js";
 import type { PiLensProjectConfig } from "../project-lens-config.js";
 
 export type DefectClass =
@@ -130,7 +131,6 @@ export interface RunnerDefinition {
 	id: string;
 	appliesTo: readonly FileKind[];
 	priority: number;
-	enabledByDefault: boolean;
 	/** Skip this runner for test files (false positive reduction) */
 	skipTestFiles?: boolean;
 	/** Per-runner wall-clock timeout in ms; overrides dispatch.runnerTimeoutMs when set */
@@ -202,6 +202,19 @@ export interface DispatchContext {
 	readonly cwd: string;
 	readonly kind: FileKind | undefined;
 	readonly fileRole: FileRole;
+	/**
+	 * When `fileRole === "generated"`: the evidence tier that decided the
+	 * verdict (undefined otherwise). Threaded from `createDispatchContext` so
+	 * the generated short-circuit can emit a `dispatch_skipped_generated`
+	 * phase record without re-reading the file (refs #2346).
+	 */
+	readonly generatedEvidence?: GeneratedArtifactEvidence;
+	/**
+	 * When `generatedEvidence === "line-shape"`: the measured mean non-empty
+	 * line length that crossed the threshold. Undefined for path/header/decl
+	 * evidence tiers (refs #2346).
+	 */
+	readonly generatedLineShapeMean?: number;
 	readonly pi: PiAgentAPI;
 	readonly autofix: boolean;
 	readonly deltaMode: boolean;
