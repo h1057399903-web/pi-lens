@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "package": "pi-lens",
+  "extension": "dist/index.js",
+  "requiredTools": [
+    "lens_diagnostics",
+    "lsp_diagnostics",
+    "symbol_search",
+    "project_report",
+    "module_report",
+    "read_symbol",
+    "read_enclosing",
+    "pi_lens_activate_tools"
+  ],
+  "requiredCommands": [
+    "lens-toggle",
+    "lens-context-toggle",
+    "lens-widget-toggle",
+    "lens-tdi",
+    "lens-map",
+    "lens-health",
+    "lens-perf",
+    "lens-tools",
+    "lens-allow-edit"
+  ]
+}
