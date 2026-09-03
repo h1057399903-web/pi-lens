@@ -42,6 +42,19 @@ Downstream-only files stay separate from upstream implementation code:
 Do not carry implementation patches without recording their purpose, upstream
 issue or PR, and removal condition in this section.
 
+## Inherited upstream workflows
+
+The fork inherited eighteen upstream GitHub Actions workflows. They are
+disabled through the repository's Actions settings (not deleted from the
+tree) because they encode upstream-repo-specific process — merge-train
+dispatch validation, per-PR changelog fragments and PR-title lint, greetings
+and stale bots, nightly smokes — that cannot pass or is unwanted in this
+downstream. Disabling them at the API level keeps the tree identical to
+upstream, so synchronization merges never conflict on `.github/workflows`.
+The lane's own `Downstream compatibility` workflow is the only active one.
+Re-enable any of them only with a recorded reason, mirroring what upstream
+CI covers that the lane workflow does not.
+
 ## Extension entry point
 
 Unlike pi-web-access, whose entry point is repository source, pi-lens's
