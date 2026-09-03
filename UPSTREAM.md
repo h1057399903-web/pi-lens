@@ -23,9 +23,14 @@ upstream.
 Downstream-only files stay separate from upstream implementation code:
 
 - `UPSTREAM.md` records provenance, synchronization, release, and rollback
-  policy. It is force-tracked: the upstream `.gitignore` lists this name, so
-  adding it requires `git add -f`, and upstream changes to that entry never
-  affect the tracked file.
+  policy. The upstream `.gitignore` ignores every `*.md` outside an explicit
+  whitelist, and `tests/config/gitignore-tracked-shadow.test.ts` forbids
+  tracked-but-ignored files because they are invisible to `rg` and GitHub
+  code search. This downstream therefore appends a single trailing
+  `!UPSTREAM.md` negation to `.gitignore` so the policy file is genuinely
+  visible and searchable rather than force-tracked in a shadowed state.
+  Remove the negation if upstream ever offers an official provenance-doc
+  allowlist.
 - `.github/workflows/downstream-compat.yml` runs the upstream checks on Linux
   (Node.js 22.19.0, the runtime upstream CI itself tests — the package
   declares no `engines` field) and the manually dispatched disposable
